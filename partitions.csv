@@ -1,0 +1,12 @@
+# ESP32-C6 intercom firmware — 16MB Flash partition table
+# Name,     Type, SubType,  Offset,   Size,    Flags
+# Layout errata: design.md D4 / tasks.md 1.4 originally specified otadata at
+# 0xf000/0x8000, which overlaps ota_0 at 0x10000 (otadata ends 0x17000).
+# Fixed: shrink nvs to 0x5000 (20KB) and otadata to 0x2000 (8KB, the ESP-IDF
+# minimum for the two esp_ota_select_entry sectors). data partitions are not
+# required to align to 0x10000 (design D4 note); app partitions remain aligned.
+nvs,        data, nvs,     0x9000,  0x5000,
+otadata,    data, ota,     0xe000,  0x2000,
+ota_0,      app,  ota_0,   0x10000, 0x700000,
+ota_1,      app,  ota_1,   0x710000,0x700000,
+resource,   data, 0x40,    0xE10000,0x1F0000,

@@ -1,0 +1,8 @@
+[toolchain]
+channel = "nightly-2026-06-22"
+components = ["rust-src"]
+# Note: the `riscv32imac-esp-espidf` target has NO precompiled rust-std on the
+# standard rustup channel. It is built from source via `build-std` in
+# `.cargo/config.toml` (which is why `rust-src` is required). Do NOT add a
+# `targets = [...]` line here — it would make rustup try to download a
+# non-existent rust-std artifact and fail.

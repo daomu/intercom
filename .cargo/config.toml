@@ -1,0 +1,30 @@
+[build]
+target = "riscv32imac-esp-espidf"
+
+[target.'cfg(target_os = "espidf")']
+linker = "ldproxy"
+runner = "espflash flash --monitor"
+rustflags = ["--cfg", "espidf_time64"]
+
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[env]
+MCU = "esp32c6"
+ESP_IDF_VERSION = "v5.5.3"
+ESP_IDF_TOOLS_INSTALL_DIR = "workspace"
+# Point esp-idf-sys at the already-installed local ESP-IDF tree so it uses
+# `EspIdfOrigin::Custom` (no `git remote show origin` network probe). Needed
+# where github.com is unreachable (e.g. restricted networks). `relative = true`
+# resolves against this `.cargo/config.toml`'s directory (project root).
+IDF_PATH = { value = ".embuild/espressif/esp-idf/v5.5.3", relative = true }
+# Copy the custom partition table into the esp-idf-sys CMake out dir so that
+# ESP-IDF's partition_table component (which resolves
+# CONFIG_PARTITION_TABLE_CUSTOM_FILENAME relative to the cmake PROJECT_DIR, i.e.
+# the out dir) can find it. `relative = true` resolves the base against this
+# `.cargo/config.toml`'s directory (the cargo project root), keeping it portable.
+ESP_IDF_GLOB_PARTITIONS_BASE = { value = ".", relative = true }
+ESP_IDF_GLOB_PARTITIONS_CSV = "partitions.csv"
+
+[net]
+retry = 3

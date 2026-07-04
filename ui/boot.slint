@@ -1,0 +1,30 @@
+// Boot placeholder screen for the intercom firmware (change 01/17).
+// Validated at compile time by `slint_build::compile` in build.rs. The slint
+// *runtime* backend driving the ST7789 LCD is wired up in change 02
+// (hal-bsp-drivers) per proposal.md Non-Goals.
+
+import { VerticalBox } from "std-widgets.slint";
+
+export component BootWindow inherits Window {
+    width: 240px;
+    height: 240px;
+    background: #101418;
+
+    VerticalBox {
+        alignment: center;
+
+        Text {
+            text: "Intercom Boot OK";
+            color: #E6E6E6;
+            font-size: 16px;
+            horizontal-alignment: center;
+        }
+
+        Text {
+            text: "240 \u{00D7} 240";
+            color: #8A8F98;
+            font-size: 12px;
+            horizontal-alignment: center;
+        }
+    }
+}
