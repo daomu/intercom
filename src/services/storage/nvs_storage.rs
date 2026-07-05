@@ -241,6 +241,16 @@ impl StorageService for NvsStorage {
         }
         Ok(())
     }
+
+    fn set_safe_boot_flag(&self, v: bool) -> Result<(), StorageError> {
+        let nvs = self.open("diag")?;
+        write_bool(&nvs, "safe_boot_flag", v)
+    }
+
+    fn set_last_reset_reason(&self, reason: u32) -> Result<(), StorageError> {
+        let nvs = self.open("diag")?;
+        write_u32(&nvs, "last_reset_reason", reason)
+    }
 }
 
 // EspNvsPartition<NvsDefault> is Send (Arc<NvsDefault> where NvsDefault: Send).

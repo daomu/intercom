@@ -1,0 +1,46 @@
+// About page (safety-diagnostics change 16, task 5.1).
+// Read-only display: firmware version, reset reason, abnormal boot count,
+// safe-boot flag. No buttons or editable fields (D5: pure display).
+
+import { VerticalBox } from "std-widgets.slint";
+
+export component AboutPage inherits Window {
+    // Properties set from Rust via slint::Weak::set_property.
+    in-property <string> firmware-version: "1.0.0";
+    in-property <string> reset-reason: "正常上电";
+    in-property <int> abnormal-boot-count: 0;
+    in-property <bool> safe-boot-flag: false;
+
+    min-width: 240px;
+    min-height: 240px;
+    background: #101418;
+
+    VerticalBox {
+        Text {
+            text: "关于";
+            color: #ffffff;
+            font-size: 18px;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: "固件版本: " + firmware-version;
+            color: #c0c0c0;
+            font-size: 12px;
+        }
+        Text {
+            text: "复位原因: " + reset-reason;
+            color: #c0c0c0;
+            font-size: 12px;
+        }
+        Text {
+            text: "异常重启: " + abnormal-boot-count;
+            color: #c0c0c0;
+            font-size: 12px;
+        }
+        Text {
+            text: "安全启动: " + (safe-boot-flag ? "是" : "否");
+            color: #c0c0c0;
+            font-size: 12px;
+        }
+    }
+}

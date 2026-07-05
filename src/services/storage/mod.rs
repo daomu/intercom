@@ -25,4 +25,8 @@ pub trait StorageService: Send + Sync + Debug {
     fn load_diag(&self) -> DiagInfo;
     fn inc_abnormal_boot(&self) -> Result<(), StorageError>;
     fn clear_diag(&self) -> Result<(), StorageError>;
+    /// Persist the safe-boot flag (set when abnormal_boot_cnt >= threshold).
+    fn set_safe_boot_flag(&self, v: bool) -> Result<(), StorageError>;
+    /// Persist the most recent reset reason code (called early in main).
+    fn set_last_reset_reason(&self, reason: u32) -> Result<(), StorageError>;
 }

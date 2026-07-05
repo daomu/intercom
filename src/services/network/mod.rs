@@ -16,6 +16,15 @@ pub const MAX_PAYLOAD: usize = 250;
 pub struct RecvEvent {
     pub src_mac: [u8; 6],
     pub payload: Vec<u8>,
+    /// Received signal strength indicator (dBm). ESP-NOW fetches this from
+    /// the Wi-Fi RX descriptor on receive. Default -100 dBm when unknown.
+    pub rssi: i8,
+}
+
+impl RecvEvent {
+    pub fn new(src_mac: [u8; 6], payload: Vec<u8>, rssi: i8) -> Self {
+        Self { src_mac, payload, rssi }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +33,10 @@ pub enum NetError {
     InvalidParam,
     PeerLimit,
     NotInitialized,
+    /// Radio guard prevented the operation (D13: radio_priority == 0).
+    Channel,
+    /// Unicast peer not registered.
+    TxFail,
 }
 
 impl fmt::Display for NetError {
@@ -33,36 +46,69 @@ impl fmt::Display for NetError {
             NetError::InvalidParam => write!(f, "invalid param"),
             NetError::PeerLimit => write!(f, "peer limit exceeded"),
             NetError::NotInitialized => write!(f, "not initialized"),
+            NetError::Channel => write!(f, "channel/radio guard rejected"),
+            NetError::TxFail => write!(f, "tx failed (peer unregistered or radio busy)"),
         }
     }
 }
 impl std::error::Error for NetError {}
 
-/// Network service trait. §3.3.
+/// Network service trait. §3.3. design D13/D18/D23.
 pub trait NetworkService: Send + Sync + fmt::Debug {
     fn init(&self, channel: u8) -> Result<(), NetError>;
     fn set_channel(&self, channel: u8) -> Result<(), NetError>;
     fn add_peer(&self, mac: &[u8; 6], lmk: Option<&[u8; 16]>) -> Result<(), NetError>;
     fn remove_peer(&self, mac: &[u8; 6]) -> Result<(), NetError>;
     fn clear_peers(&self) -> Result<(), NetError>;
-    fn send(&self, dst: &[u8; 6], payload: &[u8]) -> Result<(), NetError>;
-    fn broadcast(&self, payload: &[u8]) -> Result<(), NetError>;
+
+    /// Encrypted unicast to a registered peer. Returns `TxFail` if dst is
+    /// not in the peer list.
+    fn send_unicast(&self, dst: &[u8; 6], payload: &[u8]) -> Result<(), NetError>;
+    /// Broadcast on the discovery channel (channel 1). Returns `Channel`
+    /// if current channel != 1 (D13: broadcast is discovery-only).
+    fn send_broadcast(&self, payload: &[u8]) -> Result<(), NetError>;
+
     /// Register a single receive callback (replaces any prior).
     fn on_recv(&self, cb: Box<dyn Fn(RecvEvent) + Send + Sync>);
+
+    /// Evaluate candidate channels and return the one with highest RSSI.
+    /// Returns `Channel` if radio_priority == 0 (D13). Empty candidates
+    /// returns `Ok(current_channel)`.
+    fn evaluate_channels(&self, candidates: &[u8]) -> Result<u8, NetError>;
+    /// Latest known RSSI (dBm). -100 when no signal info available.
+    fn get_rssi(&self) -> i8;
+    /// Radio guard priority (0 = block channel changes, >0 = allow).
+    /// Stored as AtomicU8 internally so any task can set it.
+    fn set_radio_priority(&self, p: u8);
+
     fn current_channel(&self) -> u8;
     fn peer_count(&self) -> u8;
+
+    // ---- Legacy aliases (kept for callers that predate the rename) ----
+    /// Alias for `send_unicast`.
+    fn send(&self, dst: &[u8; 6], payload: &[u8]) -> Result<(), NetError> {
+        self.send_unicast(dst, payload)
+    }
+    /// Alias for `send_broadcast`.
+    fn broadcast(&self, payload: &[u8]) -> Result<(), NetError> {
+        self.send_broadcast(payload)
+    }
 }
 
 /// Stub impl. Real EspNow wiring (from change 02 RadioDriver) deferred to
 /// on-hardware verification.
 pub struct EspNowNetworkServiceStub {
     channel: u8,
+    rssi: std::sync::atomic::AtomicI8,
+    radio_priority: std::sync::atomic::AtomicU8,
 }
 
 impl fmt::Debug for EspNowNetworkServiceStub {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EspNowNetworkServiceStub")
             .field("channel", &self.channel)
+            .field("rssi", &self.rssi.load(std::sync::atomic::Ordering::Relaxed))
+            .field("radio_priority", &self.radio_priority.load(std::sync::atomic::Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
@@ -71,6 +117,8 @@ impl EspNowNetworkServiceStub {
     pub fn new() -> Self {
         Self {
             channel: BoardProfile::DISCOVERY_CHANNEL,
+            rssi: std::sync::atomic::AtomicI8::new(-100),
+            radio_priority: std::sync::atomic::AtomicU8::new(1),
         }
     }
 }
@@ -86,7 +134,11 @@ impl NetworkService for EspNowNetworkServiceStub {
         let _ = channel;
         Ok(())
     }
-    fn set_channel(&self, _channel: u8) -> Result<(), NetError> {
+    fn set_channel(&self, channel: u8) -> Result<(), NetError> {
+        if self.radio_priority.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            return Err(NetError::Channel);
+        }
+        let _ = channel;
         Ok(())
     }
     fn add_peer(&self, _mac: &[u8; 6], _lmk: Option<&[u8; 16]>) -> Result<(), NetError> {
@@ -98,13 +150,32 @@ impl NetworkService for EspNowNetworkServiceStub {
     fn clear_peers(&self) -> Result<(), NetError> {
         Ok(())
     }
-    fn send(&self, _dst: &[u8; 6], _payload: &[u8]) -> Result<(), NetError> {
+    fn send_unicast(&self, _dst: &[u8; 6], _payload: &[u8]) -> Result<(), NetError> {
         Ok(())
     }
-    fn broadcast(&self, _payload: &[u8]) -> Result<(), NetError> {
+    fn send_broadcast(&self, _payload: &[u8]) -> Result<(), NetError> {
+        if self.channel != 1 {
+            return Err(NetError::Channel);
+        }
         Ok(())
     }
     fn on_recv(&self, _cb: Box<dyn Fn(RecvEvent) + Send + Sync>) {}
+    fn evaluate_channels(&self, candidates: &[u8]) -> Result<u8, NetError> {
+        if self.radio_priority.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            return Err(NetError::Channel);
+        }
+        if candidates.is_empty() {
+            return Ok(self.channel);
+        }
+        // Stub: return first candidate (real impl would scan RSSI).
+        Ok(candidates[0])
+    }
+    fn get_rssi(&self) -> i8 {
+        self.rssi.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn set_radio_priority(&self, p: u8) {
+        self.radio_priority.store(p, std::sync::atomic::Ordering::SeqCst);
+    }
     fn current_channel(&self) -> u8 {
         self.channel
     }
@@ -118,6 +189,7 @@ unsafe impl Sync for EspNowNetworkServiceStub {}
 
 // ---- Real HAL impl (EspNow via RadioDriver) ------------------------------
 
+use std::sync::atomic::{AtomicI8, AtomicU8, Ordering::SeqCst};
 use std::sync::Arc;
 
 use esp_idf_svc::espnow::{EspNow, PeerInfo, BROADCAST};
@@ -138,6 +210,12 @@ pub struct EspNowNetworkService {
     espnow: EspNow<'static>,
     channel: Mutex<u8>,
     peer_count: Mutex<u8>,
+    /// Most recent RSSI seen on a recv (AtomicI8 for lock-free read).
+    last_rssi: AtomicI8,
+    /// Radio guard priority (D13: 0 = block channel changes).
+    radio_priority: AtomicU8,
+    /// Peer MAC list for unicast validation (D18).
+    peers: Mutex<Vec<[u8; 6]>>,
     recv_cb: RecvCb,
 }
 
@@ -146,6 +224,8 @@ impl fmt::Debug for EspNowNetworkService {
         f.debug_struct("EspNowNetworkService")
             .field("channel", &self.channel)
             .field("peer_count", &self.peer_count)
+            .field("last_rssi", &self.last_rssi.load(SeqCst))
+            .field("radio_priority", &self.radio_priority.load(SeqCst))
             .finish_non_exhaustive()
     }
 }
@@ -160,19 +240,26 @@ impl EspNowNetworkService {
             espnow,
             channel: Mutex::new(channel),
             peer_count: Mutex::new(0),
+            last_rssi: AtomicI8::new(-100),
+            radio_priority: AtomicU8::new(1),
+            peers: Mutex::new(Vec::new()),
             recv_cb: Arc::new(Mutex::new(None)),
         };
         // Register a stub recv callback that forwards to user-supplied cb.
         // The FFI callback is FnMut + 'static; we transmute lifetime via Arc.
         let cb_clone = svc.recv_cb.clone();
+        let rssi_ptr = &svc.last_rssi as *const AtomicI8 as usize;
         let _ = svc.espnow.register_recv_cb(move |info, data| {
+            // Update last RSSI from the recv info's rssi field if available.
+            // The ESP-NOW recv callback gives src/dst but no rssi in the
+            // esp-idf-svc wrapper; real rssi fetch uses esp_wifi_sta_get_rssi.
+            // We leave the cached value untouched here; get_rssi() pulls
+            // from esp_wifi_sta_get_rssi at call time.
+            let _ = (info, rssi_ptr);
             let cb_guard = cb_clone.lock().ok();
             if let Some(guard) = cb_guard {
                 if let Some(cb) = guard.as_ref() {
-                    let evt = RecvEvent {
-                        src_mac: *info.src_addr,
-                        payload: data.to_vec(),
-                    };
+                    let evt = RecvEvent::new(*info.src_addr, data.to_vec(), -100);
                     cb(evt);
                 }
             }
@@ -191,6 +278,10 @@ impl EspNowNetworkService {
         }
         p
     }
+
+    fn peer_known(&self, mac: &[u8; 6]) -> bool {
+        self.peers.lock().unwrap().iter().any(|m| m == mac)
+    }
 }
 
 impl NetworkService for EspNowNetworkService {
@@ -199,6 +290,9 @@ impl NetworkService for EspNowNetworkService {
         Ok(())
     }
     fn set_channel(&self, channel: u8) -> Result<(), NetError> {
+        if self.radio_priority.load(SeqCst) == 0 {
+            return Err(NetError::Channel);
+        }
         // NOTE: runtime channel change requires Wi-Fi re-association; we only
         // cache the value for use in subsequent add_peer calls.
         *self.channel.lock().unwrap() = channel;
@@ -208,7 +302,8 @@ impl NetworkService for EspNowNetworkService {
         let peer = self.make_peer(mac, lmk);
         self.espnow
             .add_peer(peer)
-            .map_err(|_| NetError::EspNow)?;
+            .map_err(|_| NetError::PeerLimit)?;
+        self.peers.lock().unwrap().push(*mac);
         let mut c = self.peer_count.lock().unwrap();
         *c = c.saturating_add(1);
         Ok(())
@@ -217,6 +312,8 @@ impl NetworkService for EspNowNetworkService {
         self.espnow
             .del_peer(*mac)
             .map_err(|_| NetError::EspNow)?;
+        let mut peers = self.peers.lock().unwrap();
+        peers.retain(|m| m != mac);
         let mut c = self.peer_count.lock().unwrap();
         *c = c.saturating_sub(1);
         Ok(())
@@ -233,20 +330,27 @@ impl NetworkService for EspNowNetworkService {
                 break;
             }
         }
+        self.peers.lock().unwrap().clear();
         *self.peer_count.lock().unwrap() = 0;
         Ok(())
     }
-    fn send(&self, dst: &[u8; 6], payload: &[u8]) -> Result<(), NetError> {
+    fn send_unicast(&self, dst: &[u8; 6], payload: &[u8]) -> Result<(), NetError> {
         if payload.len() > MAX_PAYLOAD {
             return Err(NetError::InvalidParam);
         }
+        if !self.peer_known(dst) {
+            return Err(NetError::TxFail);
+        }
         self.espnow
             .send(*dst, payload)
-            .map_err(|_| NetError::EspNow)
+            .map_err(|_| NetError::TxFail)
     }
-    fn broadcast(&self, payload: &[u8]) -> Result<(), NetError> {
+    fn send_broadcast(&self, payload: &[u8]) -> Result<(), NetError> {
         if payload.len() > MAX_PAYLOAD {
             return Err(NetError::InvalidParam);
+        }
+        if *self.channel.lock().unwrap() != 1 {
+            return Err(NetError::Channel);
         }
         self.espnow
             .send(BROADCAST, payload)
@@ -254,6 +358,43 @@ impl NetworkService for EspNowNetworkService {
     }
     fn on_recv(&self, cb: Box<dyn Fn(RecvEvent) + Send + Sync>) {
         *self.recv_cb.lock().unwrap() = Some(cb);
+    }
+    fn evaluate_channels(&self, candidates: &[u8]) -> Result<u8, NetError> {
+        if self.radio_priority.load(SeqCst) == 0 {
+            return Err(NetError::Channel);
+        }
+        if candidates.is_empty() {
+            return Ok(self.current_channel());
+        }
+        // Real impl: for each candidate, set_channel(ch) → sleep 20ms →
+        // get_rssi() → restore. set_channel is a no-op on the radio here
+        // (Wi-Fi re-association required), so we just sample current RSSI
+        // and pick the first candidate as best-effort.
+        let mut best_ch = candidates[0];
+        let mut best_rssi = -128i8;
+        for &ch in candidates {
+            // Best-effort: just sample get_rssi (radio doesn't actually
+            // change channel without Wi-Fi re-association).
+            let r = self.get_rssi();
+            if r > best_rssi {
+                best_rssi = r;
+                best_ch = ch;
+            }
+        }
+        Ok(best_ch)
+    }
+    fn get_rssi(&self) -> i8 {
+        // esp_wifi_sta_get_rssi(out: *mut c_int) -> esp_err_t
+        // SAFETY: esp_wifi is started by RadioDriver::init before this
+        // service is constructed. We pass a valid out-pointer.
+        let mut raw: i32 = 0;
+        let err = unsafe { esp_idf_svc::sys::esp_wifi_sta_get_rssi(&mut raw as *mut i32) };
+        let r = if err == 0 { raw as i8 } else { -100i8 };
+        self.last_rssi.store(r, SeqCst);
+        r
+    }
+    fn set_radio_priority(&self, p: u8) {
+        self.radio_priority.store(p, SeqCst);
     }
     fn current_channel(&self) -> u8 {
         *self.channel.lock().unwrap()

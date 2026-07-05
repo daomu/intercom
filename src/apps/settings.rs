@@ -5,13 +5,18 @@
 //! `save_settings` callback, factory reset with two-step confirmation (D9).
 //! Slint rendering lands in change 17; this module hosts the testable
 //! state machine.
+//!
+//! About page data (safety-diagnostics change 16, task 5.2): the `AboutData`
+//! struct bundles the four read-only fields displayed on the About page.
 
 #![allow(dead_code)]
 
 use std::fmt;
 use std::sync::Mutex;
 
-use crate::services::storage::Settings;
+use crate::services::power::ResetReason;
+use crate::services::storage::{DiagInfo, Settings, StorageService};
+use crate::board_profile::BoardProfile;
 
 /// Settings page index (PRD §6.2, design D7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +211,69 @@ pub trait SettingsAppTrait: Send + Sync + fmt::Debug {
     fn load(&self) -> Settings;
     fn save(&self, s: &Settings);
     fn reset(&self);
+}
+
+// ---- About page data (safety-diagnostics change 16, task 5.2) -----------
+
+/// Read-only data shown on the About page (D5). All four fields come from
+/// `BoardProfile` / `DiagInfo` — never from live `PowerService::reset_reason()`
+/// (the diag value is the persisted snapshot from boot time).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AboutData {
+    pub firmware_version: &'static str,
+    pub reset_reason: ResetReason,
+    pub abnormal_boot_count: u32,
+    pub safe_boot_flag: bool,
+}
+
+impl AboutData {
+    /// Build from the persisted diag snapshot. Per task 5.2, the reset reason
+    /// comes from `DiagInfo.last_reset_reason` (NOT from `PowerService`).
+    pub fn from_diag(diag: &DiagInfo) -> Self {
+        Self {
+            firmware_version: BoardProfile::FIRMWARE_VERSION,
+            reset_reason: ResetReason::from_code(diag.last_reset_reason),
+            abnormal_boot_count: diag.abnormal_boot_cnt,
+            safe_boot_flag: diag.safe_boot_flag,
+        }
+    }
+
+    /// Display string for the reset reason (task 5.3).
+    pub fn reset_reason_display(&self) -> &'static str {
+        self.reset_reason.display()
+    }
+}
+
+impl Default for AboutData {
+    fn default() -> Self {
+        Self {
+            firmware_version: BoardProfile::FIRMWARE_VERSION,
+            reset_reason: ResetReason::PowerOn,
+            abnormal_boot_count: 0,
+            safe_boot_flag: false,
+        }
+    }
+}
+
+/// Standalone factory-reset routine (safety-diagnostics task 6.2).
+/// Calls reset_settings + clear_group + clear_diag best-effort, then signals
+/// the caller to invoke `esp_idf_svc::system::reset()`. Each step logs but
+/// does not abort on error (D4: best-effort, no panic).
+pub fn factory_reset<S: StorageService>(storage: &S) -> Result<(), ()> {
+    let mut ok = true;
+    if let Err(e) = storage.reset_settings() {
+        log::error!("factory_reset: reset_settings failed: {e:?}");
+        ok = false;
+    }
+    if let Err(e) = storage.clear_group() {
+        log::error!("factory_reset: clear_group failed: {e:?}");
+        ok = false;
+    }
+    if let Err(e) = storage.clear_diag() {
+        log::error!("factory_reset: clear_diag failed: {e:?}");
+        ok = false;
+    }
+    if ok { Ok(()) } else { Err(()) }
 }
 
 #[cfg(test)]

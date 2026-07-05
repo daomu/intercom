@@ -40,30 +40,150 @@ impl fmt::Display for AudioError {
 }
 impl std::error::Error for AudioError {}
 
-/// Audio service trait. §3.4.
+// ---- Voice effect stage (D5: insert point for voice changer) -----------
+
+/// Pluggable PCM effect stage inserted between I2S capture and Opus encode.
+/// Implementations: `PassthroughStage` (default), voice-changer DSP (change 14).
+pub trait VoiceEffectStage: Send + Sync {
+    /// Mutate PCM in-place. Called per frame (~20ms / 320 samples).
+    fn process(&self, pcm: &mut [i16; PCM_SAMPLES_PER_FRAME]);
+}
+
+/// Default no-op stage. `HalAudioService` defaults to this when no voice
+/// changer is plugged in.
+pub struct PassthroughStage;
+
+impl fmt::Debug for PassthroughStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PassthroughStage")
+    }
+}
+
+impl VoiceEffectStage for PassthroughStage {
+    fn process(&self, _pcm: &mut [i16; PCM_SAMPLES_PER_FRAME]) {}
+}
+
+// ---- MixSlot (D7: 3-way mix with soft limiter) -------------------------
+
+/// One slot of the 3-way mix buffer. Indexed by `src_id` 0..3.
+#[derive(Debug, Clone, Copy)]
+pub struct MixSlot {
+    pub pcm: [i16; PCM_SAMPLES_PER_FRAME],
+    pub last_seq: u16,
+    pub last_update_ms: u32,
+    pub active: bool,
+}
+
+impl MixSlot {
+    pub const fn new() -> Self {
+        Self {
+            pcm: [0i16; PCM_SAMPLES_PER_FRAME],
+            last_seq: 0,
+            last_update_ms: 0,
+            active: false,
+        }
+    }
+}
+
+/// Per-source attenuation (D7: 0.7 linear to prevent 3-way sum clipping).
+pub const MIX_ATTENUATION: f32 = 0.7;
+
+/// Soft limiter (tanh-style). Hard clip would introduce harmonic distortion;
+/// tanh compresses gracefully as samples approach the rail.
+fn soft_limit(x: i32) -> i16 {
+    const RAIL: i32 = i16::MAX as i32;
+    // Approximation: tanh(x) ≈ x / (1 + |x|/RAIL) — cheap, monotonic, smooth.
+    let scaled = x as f32 / RAIL as f32;
+    let compressed = scaled / (1.0 + scaled.abs());
+    (compressed * RAIL as f32) as i16
+}
+
+/// 3-way mix + soft limit. Returns the mixed PCM frame.
+pub fn mix_and_play(slots: &[MixSlot; 3], volume_u8: u8, muted: bool) -> [i16; PCM_SAMPLES_PER_FRAME] {
+    if muted {
+        return [0i16; PCM_SAMPLES_PER_FRAME];
+    }
+    let vol = (volume_u8 as f32) / 255.0;
+    let mut out = [0i16; PCM_SAMPLES_PER_FRAME];
+    for i in 0..PCM_SAMPLES_PER_FRAME {
+        let mut sum: f32 = 0.0;
+        let mut active_count = 0u32;
+        for slot in slots.iter() {
+            if slot.active {
+                sum += (slot.pcm[i] as f32) * MIX_ATTENUATION;
+                active_count += 1;
+            }
+        }
+        if active_count == 0 {
+            out[i] = 0;
+        } else {
+            let limited = soft_limit(sum as i32);
+            out[i] = ((limited as f32) * vol) as i16;
+        }
+    }
+    out
+}
+
+/// Audio service trait. §3.4. design D1-D6.
 pub trait AudioService: Send + Sync + fmt::Debug {
     fn start_capture(&self) -> Result<(), AudioError>;
     fn stop_capture(&self) -> Result<(), AudioError>;
     fn start_playback(&self) -> Result<(), AudioError>;
     fn stop_playback(&self) -> Result<(), AudioError>;
-    /// Encode captured PCM (320 samples) → Opus frame.
+
+    /// Encode captured PCM (320 samples) → Opus frame. (legacy API)
     fn encode(&self, pcm: &[i16; PCM_SAMPLES_PER_FRAME]) -> Result<AudioFrame, AudioError>;
-    /// Decode Opus frame → 320 PCM samples.
+    /// Decode Opus frame → 320 PCM samples. (legacy API)
     fn decode(&self, frame: &AudioFrame) -> Result<[i16; PCM_SAMPLES_PER_FRAME], AudioError>;
-    /// Submit decoded PCM for playback (mixed with other streams).
-    fn submit_pcm(&self, pcm: &[i16; PCM_SAMPLES_PER_FRAME]) -> Result<(), AudioError>;
+
+    /// Opus decode with PLC support. `None` requests packet-loss concealment
+    /// (4-frame threshold in `BoardProfile::PLC_CONSECUTIVE_LOSS_THRESHOLD`).
+    /// `Some(data)` decodes a normal frame.
+    fn opus_decode(
+        &self,
+        frame: Option<&[u8]>,
+    ) -> Result<[i16; PCM_SAMPLES_PER_FRAME], AudioError>;
+
+    /// Submit decoded PCM for a specific source (0..3). The service mixes
+    /// active sources via `mix_and_play` and writes the result to I2S.
+    fn submit_pcm(&self, src_id: u8, pcm: &[i16; PCM_SAMPLES_PER_FRAME])
+        -> Result<(), AudioError>;
+
+    /// Register a callback invoked on each captured+encoded frame (D5).
+    /// Replaces any prior callback. The callback receives `&AudioFrame`.
+    fn on_capture_frame(&self, cb: Box<dyn Fn(&AudioFrame) + Send + Sync>);
+
+    /// Set volume 0..=255. Mapped to attenuation coefficient in `mix_and_play`.
+    fn set_volume(&self, v: u8);
+    /// Set mute. Does NOT toggle PA (PA state is independent per D6).
+    fn set_mute(&self, m: bool);
+
     /// PA soft-start: enable PA after 1-2 frames buffer; disable before stop.
     fn pa_enable(&self, on: bool);
+
+    // ---- Legacy single-source submit_pcm (calls submit_pcm(0, _)) ----
+    /// Legacy single-source submit. Equivalent to `submit_pcm(0, pcm)`.
+    fn submit_pcm_legacy(&self, pcm: &[i16; PCM_SAMPLES_PER_FRAME]) -> Result<(), AudioError> {
+        self.submit_pcm(0, pcm)
+    }
 }
 
 /// Stub impl. Real Opus/I2S wiring deferred to on-hardware verification.
 pub struct AudioServiceStub {
     _sample_rate: u32,
+    volume: std::sync::atomic::AtomicU8,
+    mute: std::sync::atomic::AtomicBool,
+    capture_cb: Mutex<Option<Box<dyn Fn(&AudioFrame) + Send + Sync>>>,
+    slots: Mutex<[MixSlot; 3]>,
+    seq: Mutex<u16>,
 }
 
 impl fmt::Debug for AudioServiceStub {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AudioServiceStub").finish_non_exhaustive()
+        f.debug_struct("AudioServiceStub")
+            .field("volume", &self.volume.load(std::sync::atomic::Ordering::Relaxed))
+            .field("mute", &self.mute.load(std::sync::atomic::Ordering::Relaxed))
+            .finish_non_exhaustive()
     }
 }
 
@@ -71,6 +191,11 @@ impl AudioServiceStub {
     pub fn new() -> Self {
         Self {
             _sample_rate: BoardProfile::OPUS_SAMPLE_RATE,
+            volume: std::sync::atomic::AtomicU8::new(255),
+            mute: std::sync::atomic::AtomicBool::new(false),
+            capture_cb: Mutex::new(None),
+            slots: Mutex::new([MixSlot::new(); 3]),
+            seq: Mutex::new(0),
         }
     }
 }
@@ -82,30 +207,49 @@ impl Default for AudioServiceStub {
 }
 
 impl AudioService for AudioServiceStub {
-    fn start_capture(&self) -> Result<(), AudioError> {
-        Ok(())
-    }
-    fn stop_capture(&self) -> Result<(), AudioError> {
-        Ok(())
-    }
-    fn start_playback(&self) -> Result<(), AudioError> {
-        Ok(())
-    }
-    fn stop_playback(&self) -> Result<(), AudioError> {
-        Ok(())
-    }
+    fn start_capture(&self) -> Result<(), AudioError> { Ok(()) }
+    fn stop_capture(&self) -> Result<(), AudioError> { Ok(()) }
+    fn start_playback(&self) -> Result<(), AudioError> { Ok(()) }
+    fn stop_playback(&self) -> Result<(), AudioError> { Ok(()) }
+
     fn encode(&self, _pcm: &[i16; PCM_SAMPLES_PER_FRAME]) -> Result<AudioFrame, AudioError> {
+        let mut seq = self.seq.lock().unwrap();
+        *seq = seq.wrapping_add(1);
         Ok(AudioFrame {
-            seq: 0,
+            seq: *seq,
             opus_data: [0u8; MAX_OPUS_FRAME_SIZE],
             opus_len: 0,
         })
     }
+
     fn decode(&self, _frame: &AudioFrame) -> Result<[i16; PCM_SAMPLES_PER_FRAME], AudioError> {
         Ok([0i16; PCM_SAMPLES_PER_FRAME])
     }
-    fn submit_pcm(&self, _pcm: &[i16; PCM_SAMPLES_PER_FRAME]) -> Result<(), AudioError> {
+
+    fn opus_decode(
+        &self,
+        _frame: Option<&[u8]>,
+    ) -> Result<[i16; PCM_SAMPLES_PER_FRAME], AudioError> {
+        Ok([0i16; PCM_SAMPLES_PER_FRAME])
+    }
+
+    fn submit_pcm(&self, src_id: u8, pcm: &[i16; PCM_SAMPLES_PER_FRAME]) -> Result<(), AudioError> {
+        let mut slots = self.slots.lock().unwrap();
+        let idx = (src_id as usize).min(2);
+        slots[idx].pcm = *pcm;
+        slots[idx].active = true;
         Ok(())
+    }
+
+    fn on_capture_frame(&self, cb: Box<dyn Fn(&AudioFrame) + Send + Sync>) {
+        *self.capture_cb.lock().unwrap() = Some(cb);
+    }
+
+    fn set_volume(&self, v: u8) {
+        self.volume.store(v, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn set_mute(&self, m: bool) {
+        self.mute.store(m, std::sync::atomic::Ordering::SeqCst);
     }
     fn pa_enable(&self, _on: bool) {}
 }
@@ -137,6 +281,12 @@ pub struct HalAudioService {
     capturing: Mutex<bool>,
     playing: Mutex<bool>,
     seq: Mutex<u16>,
+    volume: std::sync::atomic::AtomicU8,
+    mute: std::sync::atomic::AtomicBool,
+    capture_cb: Mutex<Option<Box<dyn Fn(&AudioFrame) + Send + Sync>>>,
+    slots: Mutex<[MixSlot; 3]>,
+    /// Pluggable voice-changer stage (None = passthrough).
+    effect_stage: Mutex<Option<Box<dyn VoiceEffectStage>>>,
 }
 
 impl fmt::Debug for HalAudioService {
@@ -144,6 +294,8 @@ impl fmt::Debug for HalAudioService {
         f.debug_struct("HalAudioService")
             .field("capturing", &self.capturing)
             .field("playing", &self.playing)
+            .field("volume", &self.volume.load(std::sync::atomic::Ordering::Relaxed))
+            .field("mute", &self.mute.load(std::sync::atomic::Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
@@ -163,7 +315,17 @@ impl HalAudioService {
             capturing: Mutex::new(false),
             playing: Mutex::new(false),
             seq: Mutex::new(0),
+            volume: std::sync::atomic::AtomicU8::new(255),
+            mute: std::sync::atomic::AtomicBool::new(false),
+            capture_cb: Mutex::new(None),
+            slots: Mutex::new([MixSlot::new(); 3]),
+            effect_stage: Mutex::new(None),
         }
+    }
+
+    /// Plug in a voice-changer stage (None = passthrough).
+    pub fn set_effect_stage(&self, stage: Option<Box<dyn VoiceEffectStage>>) {
+        *self.effect_stage.lock().unwrap() = stage;
     }
 
     fn map_err(e: HalError) -> AudioError {
@@ -230,7 +392,39 @@ impl AudioService for HalAudioService {
             Err(AudioError::OpusError)
         }
     }
-    fn submit_pcm(&self, pcm: &[i16; PCM_SAMPLES_PER_FRAME]) -> Result<(), AudioError> {
+
+    fn opus_decode(
+        &self,
+        frame: Option<&[u8]>,
+    ) -> Result<[i16; PCM_SAMPLES_PER_FRAME], AudioError> {
+        #[cfg(feature = "opus")]
+        {
+            // TODO: audiopus decoder. None → decoder.decode_plc(out); Some(d) → decoder.decode(d, out).
+            let _ = frame;
+            return Ok([0i16; PCM_SAMPLES_PER_FRAME]);
+        }
+        #[cfg(not(feature = "opus"))]
+        {
+            let _ = frame;
+            Err(AudioError::OpusError)
+        }
+    }
+
+    fn submit_pcm(&self, src_id: u8, pcm: &[i16; PCM_SAMPLES_PER_FRAME]) -> Result<(), AudioError> {
+        // Deposit PCM into the per-source mix slot.
+        let mut slots = self.slots.lock().unwrap();
+        let idx = (src_id as usize).min(2);
+        slots[idx].pcm = *pcm;
+        slots[idx].active = true;
+        // Snapshot for mix (drop lock before I2S write).
+        let snapshot = *slots;
+        drop(slots);
+
+        // Mix active sources with attenuation + soft limiter.
+        let vol = self.volume.load(std::sync::atomic::Ordering::Relaxed);
+        let muted = self.mute.load(std::sync::atomic::Ordering::Relaxed);
+        let mixed = mix_and_play(&snapshot, vol, muted);
+
         let mut out = self.audio_out.lock().unwrap();
         // PA soft-start: if first frame since start_playback, enable PA now.
         if *self.playing.lock().unwrap() {
@@ -238,11 +432,22 @@ impl AudioService for HalAudioService {
         }
         // Reinterpret [i16; N] as [u8; N*2] (little-endian, native I2S format).
         let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(pcm.as_ptr() as *const u8, std::mem::size_of_val(pcm))
+            std::slice::from_raw_parts(mixed.as_ptr() as *const u8, std::mem::size_of_val(&mixed))
         };
         out.write_pcm(&mut self.i2s.lock().unwrap(), bytes)
             .map_err(Self::map_err)?;
         Ok(())
+    }
+
+    fn on_capture_frame(&self, cb: Box<dyn Fn(&AudioFrame) + Send + Sync>) {
+        *self.capture_cb.lock().unwrap() = Some(cb);
+    }
+
+    fn set_volume(&self, v: u8) {
+        self.volume.store(v, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn set_mute(&self, m: bool) {
+        self.mute.store(m, std::sync::atomic::Ordering::SeqCst);
     }
     fn pa_enable(&self, on: bool) {
         let mut out = self.audio_out.lock().unwrap();

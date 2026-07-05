@@ -91,4 +91,14 @@ impl BoardProfile {
     // LEDC PWM for backlight (5kHz, 8-bit duty — 256 levels)
     pub const BACKLIGHT_PWM_FREQ_HZ: u32 = 5_000;
     pub const BACKLIGHT_PWM_DUTY_RES: u8 = 8; // 2^8 = 256
+
+    // ---- Safety / diagnostics (change 16) ----
+    pub const FIRMWARE_VERSION: &'static str = "1.0.0";
+    pub const SCHEMA_VER: u16 = 1;
+    pub const ABNORMAL_BOOT_THRESHOLD: u32 = 3;
+    pub const PAIR_JOIN_REASON_INCOMPATIBLE: u8 = 2;
+
+    // ---- Opus PLC / bitrate (change 17 hardware-tuned, defaults per spec) ----
+    pub const PLC_CONSECUTIVE_LOSS_THRESHOLD: u8 = 4; // 4 frames / 80ms 静音封底
+    pub const OPUS_BITRATE: u32 = 32_000; // 32 kbps VoIP default
 }

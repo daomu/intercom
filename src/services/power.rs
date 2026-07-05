@@ -27,6 +27,48 @@ pub enum ResetReason {
     Unknown,
 }
 
+impl ResetReason {
+    /// Map to the u32 code persisted in `diag.last_reset_reason` (safety-diagnostics D2).
+    pub fn to_code(self) -> u32 {
+        match self {
+            ResetReason::PowerOn => 0,
+            ResetReason::Brownout => 1,
+            ResetReason::Wdt => 2,
+            ResetReason::Panic => 3,
+            ResetReason::Unknown => 4,
+        }
+    }
+
+    /// Reverse of `to_code` — used by About page to recover the ResetReason
+    /// from the persisted diag code.
+    pub fn from_code(code: u32) -> Self {
+        match code {
+            0 => ResetReason::PowerOn,
+            1 => ResetReason::Brownout,
+            2 => ResetReason::Wdt,
+            3 => ResetReason::Panic,
+            _ => ResetReason::Unknown,
+        }
+    }
+
+    /// Display string for the About page (safety-diagnostics task 5.3).
+    pub fn display(self) -> &'static str {
+        match self {
+            ResetReason::PowerOn => "正常上电",
+            ResetReason::Brownout => "电压不足",
+            ResetReason::Wdt => "看门狗",
+            ResetReason::Panic => "异常崩溃",
+            ResetReason::Unknown => "未知",
+        }
+    }
+}
+
+impl fmt::Display for ResetReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.display())
+    }
+}
+
 /// Battery 4-bar icon. design D8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatteryIcon {
@@ -230,17 +272,7 @@ impl<S: StorageService> PowerService for HalPowerService<S> {
         s.standby = false;
     }
     fn reset_reason(&self) -> ResetReason {
-        match IdfResetReason::get() {
-            IdfResetReason::PowerOn | IdfResetReason::DeepSleep | IdfResetReason::PowerGlitch => {
-                ResetReason::PowerOn
-            }
-            IdfResetReason::Brownout => ResetReason::Brownout,
-            IdfResetReason::Watchdog
-            | IdfResetReason::InterruptWatchdog
-            | IdfResetReason::TaskWatchdog => ResetReason::Wdt,
-            IdfResetReason::Panic => ResetReason::Panic,
-            _ => ResetReason::Unknown,
-        }
+        current_reset_reason()
     }
     fn abnormal_boot_count(&self) -> u32 {
         let diag: DiagInfo = self.storage.load_diag();
@@ -250,6 +282,29 @@ impl<S: StorageService> PowerService for HalPowerService<S> {
 
 unsafe impl<S: StorageService + Send> Send for HalPowerService<S> {}
 unsafe impl<S: StorageService + Send> Sync for HalPowerService<S> {}
+
+/// Free function mapping ESP-IDF reset reason to project's `ResetReason`.
+/// Used by `HalPowerService::reset_reason()` and by `main.rs` early in boot
+/// (before `Hal` is constructed) for the safety-diagnostics flow (D2).
+pub fn map_idf_reset_reason(r: IdfResetReason) -> ResetReason {
+    match r {
+        IdfResetReason::PowerOn | IdfResetReason::DeepSleep | IdfResetReason::PowerGlitch => {
+            ResetReason::PowerOn
+        }
+        IdfResetReason::Brownout => ResetReason::Brownout,
+        IdfResetReason::Watchdog
+        | IdfResetReason::InterruptWatchdog
+        | IdfResetReason::TaskWatchdog => ResetReason::Wdt,
+        IdfResetReason::Panic => ResetReason::Panic,
+        _ => ResetReason::Unknown,
+    }
+}
+
+/// Read the current boot's reset reason. Convenience wrapper for `main.rs`
+/// to call before any service is constructed.
+pub fn current_reset_reason() -> ResetReason {
+    map_idf_reset_reason(IdfResetReason::get())
+}
 
 #[cfg(test)]
 mod tests {
