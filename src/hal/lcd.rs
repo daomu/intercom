@@ -71,7 +71,7 @@ impl LcdDriver {
         let spi_dev = SpiDeviceDriver::new(spi_driver, Some(cs_pin), &dev_config)
             .map_err(|e| HalError::LcdInitFailed(format!("SPI device: {e}")))?;
 
-        let mut dc = PinDriver::output(dc_pin)
+        let dc = PinDriver::output(dc_pin)
             .map_err(|e| HalError::LcdInitFailed(format!("DC pin: {e}")))?;
         let mut rst = PinDriver::output(rst_pin)
             .map_err(|e| HalError::LcdInitFailed(format!("RST pin: {e}")))?;

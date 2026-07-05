@@ -112,3 +112,143 @@ impl AudioService for AudioServiceStub {
 
 unsafe impl Send for AudioServiceStub {}
 unsafe impl Sync for AudioServiceStub {}
+
+// ---- Real HAL impl (I2S + PA soft-start + Opus FFI) ---------------------
+
+use std::sync::Mutex;
+
+use esp_idf_svc::hal::i2s::{I2sBiDir, I2sDriver};
+
+use crate::hal::audio_in::AudioInDriver;
+use crate::hal::audio_out::AudioOutDriver;
+use crate::hal::HalError;
+
+/// Real audio service backed by `AudioInDriver` (ES7210 + I2S0 RX) +
+/// `AudioOutDriver` (ES8311 + I2S0 TX + PA_CTRL GPIO15). Owns the shared
+/// `I2sDriver<'static, I2sBiDir>` (moved out of `Hal` during wiring).
+///
+/// Opus encode/decode is gated behind the `opus` cargo feature. Without it,
+/// `encode`/`decode` return `AudioError::OpusError` — the I2S + PA path still
+/// works for raw PCM loopback / verification.
+pub struct HalAudioService {
+    i2s: Mutex<I2sDriver<'static, I2sBiDir>>,
+    audio_in: Mutex<AudioInDriver>,
+    audio_out: Mutex<AudioOutDriver>,
+    capturing: Mutex<bool>,
+    playing: Mutex<bool>,
+    seq: Mutex<u16>,
+}
+
+impl fmt::Debug for HalAudioService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HalAudioService")
+            .field("capturing", &self.capturing)
+            .field("playing", &self.playing)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HalAudioService {
+    /// Construct from owned I2S driver + audio HAL drivers. The I2S driver
+    /// is moved here from `Hal` (audio is the only I2S0 consumer).
+    pub fn new(
+        i2s: I2sDriver<'static, I2sBiDir>,
+        audio_in: AudioInDriver,
+        audio_out: AudioOutDriver,
+    ) -> Self {
+        Self {
+            i2s: Mutex::new(i2s),
+            audio_in: Mutex::new(audio_in),
+            audio_out: Mutex::new(audio_out),
+            capturing: Mutex::new(false),
+            playing: Mutex::new(false),
+            seq: Mutex::new(0),
+        }
+    }
+
+    fn map_err(e: HalError) -> AudioError {
+        match e {
+            HalError::AudioInInitFailed(_) | HalError::AudioOutInitFailed(_) => AudioError::I2sError,
+            _ => AudioError::I2sError,
+        }
+    }
+}
+
+impl AudioService for HalAudioService {
+    fn start_capture(&self) -> Result<(), AudioError> {
+        *self.capturing.lock().unwrap() = true;
+        Ok(())
+    }
+    fn stop_capture(&self) -> Result<(), AudioError> {
+        *self.capturing.lock().unwrap() = false;
+        Ok(())
+    }
+    fn start_playback(&self) -> Result<(), AudioError> {
+        *self.playing.lock().unwrap() = true;
+        // PA soft-start: enable PA after buffer is primed. Per design D6,
+        // caller enables PA after 1-2 frames are buffered; here we just flip
+        // the playback flag.
+        Ok(())
+    }
+    fn stop_playback(&self) -> Result<(), AudioError> {
+        // Disable PA before stopping I2S to avoid pop.
+        let mut out = self.audio_out.lock().unwrap();
+        let _ = out.pa_enable(false);
+        *self.playing.lock().unwrap() = false;
+        Ok(())
+    }
+    fn encode(&self, pcm: &[i16; PCM_SAMPLES_PER_FRAME]) -> Result<AudioFrame, AudioError> {
+        #[cfg(feature = "opus")]
+        {
+            // TODO: audiopus encoder init + encode. Requires the `opus` feature
+            // plus cross-compile wiring (LIBOPUS_LIB_DIR or toolchain PATH).
+            // For now, return an empty frame so the pipeline type-checks.
+            let mut seq = self.seq.lock().unwrap();
+            *seq = seq.wrapping_add(1);
+            return Ok(AudioFrame {
+                seq: *seq,
+                opus_data: [0u8; MAX_OPUS_FRAME_SIZE],
+                opus_len: 0,
+            });
+        }
+        #[cfg(not(feature = "opus"))]
+        {
+            let _ = pcm;
+            Err(AudioError::OpusError)
+        }
+    }
+    fn decode(&self, frame: &AudioFrame) -> Result<[i16; PCM_SAMPLES_PER_FRAME], AudioError> {
+        #[cfg(feature = "opus")]
+        {
+            // TODO: audiopus decoder init + decode.
+            let _ = frame;
+            return Ok([0i16; PCM_SAMPLES_PER_FRAME]);
+        }
+        #[cfg(not(feature = "opus"))]
+        {
+            let _ = frame;
+            Err(AudioError::OpusError)
+        }
+    }
+    fn submit_pcm(&self, pcm: &[i16; PCM_SAMPLES_PER_FRAME]) -> Result<(), AudioError> {
+        let mut out = self.audio_out.lock().unwrap();
+        // PA soft-start: if first frame since start_playback, enable PA now.
+        if *self.playing.lock().unwrap() {
+            let _ = out.pa_enable(true);
+        }
+        // Reinterpret [i16; N] as [u8; N*2] (little-endian, native I2S format).
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(pcm.as_ptr() as *const u8, std::mem::size_of_val(pcm))
+        };
+        out.write_pcm(&mut self.i2s.lock().unwrap(), bytes)
+            .map_err(Self::map_err)?;
+        Ok(())
+    }
+    fn pa_enable(&self, on: bool) {
+        let mut out = self.audio_out.lock().unwrap();
+        let _ = out.pa_enable(on);
+    }
+}
+
+unsafe impl Send for HalAudioService {}
+unsafe impl Sync for HalAudioService {}

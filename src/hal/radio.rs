@@ -18,7 +18,7 @@ use crate::hal::HalError;
 
 pub struct RadioDriver {
     _wifi: BlockingWifi<EspWifi<'static>>,
-    espnow: EspNow<'static>,
+    espnow: Option<EspNow<'static>>,
     channel: u8,
 }
 
@@ -26,6 +26,7 @@ impl std::fmt::Debug for RadioDriver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RadioDriver")
             .field("channel", &self.channel)
+            .field("has_espnow", &self.espnow.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -59,14 +60,20 @@ impl RadioDriver {
 
         Ok(Self {
             _wifi: wifi,
-            espnow,
+            espnow: Some(espnow),
             channel: BoardProfile::DISCOVERY_CHANNEL,
         })
     }
 
-    /// Borrow the ESP-NOW handle for NetworkService to use (add_peer, send, etc.).
-    pub fn espnow(&self) -> &EspNow<'static> {
-        &self.espnow
+    /// Take ownership of the ESP-NOW handle (for passing to NetworkService).
+    /// After this call, `espnow()` returns `None`.
+    pub fn take_espnow(&mut self) -> Option<EspNow<'static>> {
+        self.espnow.take()
+    }
+
+    /// Borrow the ESP-NOW handle, if not yet taken.
+    pub fn espnow(&self) -> Option<&EspNow<'static>> {
+        self.espnow.as_ref()
     }
 
     pub fn channel(&self) -> u8 {
