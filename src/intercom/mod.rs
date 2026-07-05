@@ -11,5 +11,6 @@ pub mod pairing;
 pub mod packet;
 pub mod power_mgmt;
 pub mod safety;
+pub mod state;
 pub mod voice;
 pub mod voice_changer;

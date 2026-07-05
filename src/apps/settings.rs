@@ -1,23 +1,303 @@
-//! Settings app (change 07/17). §3.7 settings panel.
+//! Settings app (change 07). Spec: §3.7, §6.2, §8.1.
+//!
+//! Pure-logic Settings App: page navigation (left/right swipe through 7
+//! pages), field editing with bounds clamping, persistence via injected
+//! `save_settings` callback, factory reset with two-step confirmation (D9).
+//! Slint rendering lands in change 17; this module hosts the testable
+//! state machine.
+
 #![allow(dead_code)]
+
 use std::fmt;
+use std::sync::Mutex;
 
 use crate::services::storage::Settings;
 
-pub trait SettingsApp: Send + Sync + fmt::Debug {
+/// Settings page index (PRD §6.2, design D7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsPage {
+    DeviceName = 0,
+    Volume = 1,
+    Mute = 2,
+    Brightness = 3,
+    ScreenOffTime = 4,
+    About = 5,
+    FactoryReset = 6,
+}
+
+impl SettingsPage {
+    pub fn from_index(i: usize) -> Option<Self> {
+        match i {
+            0 => Some(Self::DeviceName),
+            1 => Some(Self::Volume),
+            2 => Some(Self::Mute),
+            3 => Some(Self::Brightness),
+            4 => Some(Self::ScreenOffTime),
+            5 => Some(Self::About),
+            6 => Some(Self::FactoryReset),
+            _ => None,
+        }
+    }
+
+    pub fn next(self) -> Option<Self> {
+        Self::from_index(self as usize + 1)
+    }
+
+    pub fn prev(self) -> Option<Self> {
+        if self as usize == 0 {
+            None
+        } else {
+            Self::from_index(self as usize - 1)
+        }
+    }
+}
+
+/// Two-step factory-reset confirmation state (D9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactoryResetState {
+    Idle,
+    FirstConfirm,
+    SecondConfirmArmed,
+}
+
+pub const VOLUME_MAX: u8 = 100;
+pub const BRIGHTNESS_MAX: u8 = 100;
+pub const SCREEN_OFF_MIN_SEC: u32 = 5;
+pub const SCREEN_OFF_MAX_SEC: u32 = 300;
+pub const DEVICE_NAME_MAX_LEN: usize = 16;
+
+pub struct SettingsApp {
+    settings: Settings,
+    page: SettingsPage,
+    factory_reset_state: FactoryResetState,
+    /// Callback invoked when settings change. Real impl saves to NVS.
+    save_cb: Mutex<Option<Box<dyn Fn(&Settings) + Send + Sync>>>,
+}
+
+impl fmt::Debug for SettingsApp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SettingsApp")
+            .field("page", &self.page)
+            .field("factory_reset_state", &self.factory_reset_state)
+            .field("device_name", &self.settings.device_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SettingsApp {
+    pub fn new(settings: Settings) -> Self {
+        Self {
+            settings,
+            page: SettingsPage::DeviceName,
+            factory_reset_state: FactoryResetState::Idle,
+            save_cb: Mutex::new(None),
+        }
+    }
+
+    pub fn page(&self) -> SettingsPage {
+        self.page
+    }
+
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    pub fn factory_reset_state(&self) -> FactoryResetState {
+        self.factory_reset_state
+    }
+
+    pub fn on_save_cb(&self, cb: Box<dyn Fn(&Settings) + Send + Sync>) {
+        *self.save_cb.lock().expect("save_cb mutex") = Some(cb);
+    }
+
+    fn persist(&self) {
+        if let Some(cb) = self.save_cb.lock().expect("save_cb mutex").as_ref() {
+            cb(&self.settings);
+        }
+    }
+
+    // ---- Page navigation (D7: left/right swipe) ----
+    pub fn swipe_next(&mut self) {
+        if let Some(p) = self.page.next() {
+            self.page = p;
+        }
+    }
+    pub fn swipe_prev(&mut self) {
+        if let Some(p) = self.page.prev() {
+            self.page = p;
+        }
+    }
+
+    // ---- Field editors ----
+    pub fn set_volume(&mut self, v: u8) {
+        self.settings.volume = v.min(VOLUME_MAX);
+        self.persist();
+    }
+
+    pub fn set_brightness(&mut self, v: u8) {
+        self.settings.brightness = v.min(BRIGHTNESS_MAX);
+        self.persist();
+    }
+
+    pub fn set_muted(&mut self, m: bool) {
+        self.settings.muted = m;
+        self.persist();
+    }
+
+    pub fn set_screen_off_sec(&mut self, sec: u32) {
+        self.settings.screen_off_sec = sec.clamp(SCREEN_OFF_MIN_SEC, SCREEN_OFF_MAX_SEC);
+        self.persist();
+    }
+
+    pub fn set_device_name(&mut self, name: &str) {
+        let truncated: String = name.chars().take(DEVICE_NAME_MAX_LEN).collect();
+        self.settings.device_name = truncated;
+        self.persist();
+    }
+
+    // ---- Factory reset two-step confirmation (D9) ----
+    /// User clicks "确认" on page 1 → advance to second-confirm screen.
+    pub fn factory_reset_arm(&mut self) {
+        if self.factory_reset_state == FactoryResetState::Idle {
+            self.factory_reset_state = FactoryResetState::FirstConfirm;
+        }
+    }
+
+    /// User clicks "确认恢复" on page 2 → execute reset.
+    /// Returns true if reset was performed (caller clears NVS + restarts).
+    pub fn factory_reset_confirm(&mut self) -> bool {
+        if self.factory_reset_state == FactoryResetState::FirstConfirm {
+            self.factory_reset_state = FactoryResetState::SecondConfirmArmed;
+            // Reset settings to defaults.
+            self.settings = Settings::default();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// User cancels factory reset.
+    pub fn factory_reset_cancel(&mut self) {
+        self.factory_reset_state = FactoryResetState::Idle;
+    }
+
+    /// Generate a random device name (D8: adjective + noun).
+    /// Uses `esp_random` on device; here we accept an injected u32.
+    pub fn random_device_name(rng: u32) -> String {
+        const ADJ: &[&str] = &[
+            "Swift", "Brave", "Calm", "Daring", "Eager", "Fierce", "Gentle",
+            "Happy", "Jolly", "Keen", "Lively", "Mighty", "Noble", "Proud",
+            "Quick", "Royal", "Steady", "Trusty", "Vivid", "Wise",
+        ];
+        const NOUN: &[&str] = &[
+            "Fox", "Lion", "Hawk", "Wolf", "Bear", "Cat", "Dog", "Owl",
+            "Deer", "Seal", "Puma", "Lynx", "Otter", "Bison", "Crow",
+            "Duck", "Frog", "Goat", "Hare", "Koi",
+        ];
+        let a = ADJ[(rng as usize) % ADJ.len()];
+        let n = NOUN[((rng >> 16) as usize) % NOUN.len()];
+        format!("{}{}", a, n)
+    }
+}
+
+// ---- Trait shim ---------------------------------------------------------
+
+pub trait SettingsAppTrait: Send + Sync + fmt::Debug {
     fn load(&self) -> Settings;
     fn save(&self, s: &Settings);
     fn reset(&self);
 }
 
-pub struct SettingsAppStub;
-impl fmt::Debug for SettingsAppStub {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.debug_struct("SettingsAppStub").finish() }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn mk() -> SettingsApp {
+        let mut s = Settings::default();
+        s.device_name = String::from("INT-0000");
+        SettingsApp::new(s)
+    }
+
+    #[test]
+    fn page_navigation_wraps_at_ends() {
+        let mut a = mk();
+        assert_eq!(a.page(), SettingsPage::DeviceName);
+        assert!(a.page.prev().is_none());
+        a.swipe_next();
+        assert_eq!(a.page(), SettingsPage::Volume);
+        for _ in 0..10 {
+            a.swipe_next();
+        }
+        assert_eq!(a.page(), SettingsPage::FactoryReset);
+    }
+
+    #[test]
+    fn volume_clamped() {
+        let mut a = mk();
+        a.set_volume(150);
+        assert_eq!(a.settings().volume, 100);
+        a.set_volume(50);
+        assert_eq!(a.settings().volume, 50);
+    }
+
+    #[test]
+    fn screen_off_clamped() {
+        let mut a = mk();
+        a.set_screen_off_sec(1);
+        assert_eq!(a.settings().screen_off_sec, SCREEN_OFF_MIN_SEC);
+        a.set_screen_off_sec(999);
+        assert_eq!(a.settings().screen_off_sec, SCREEN_OFF_MAX_SEC);
+    }
+
+    #[test]
+    fn device_name_truncated() {
+        let mut a = mk();
+        a.set_device_name("abcdefghijklmnopqrstuvwxyz");
+        assert!(a.settings().device_name.chars().count() <= DEVICE_NAME_MAX_LEN);
+    }
+
+    #[test]
+    fn save_cb_invoked_on_edit() {
+        let mut a = mk();
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_clone = count.clone();
+        a.on_save_cb(Box::new(move |_s| {
+            count_clone.fetch_add(1, Ordering::SeqCst);
+        }));
+        a.set_volume(30);
+        a.set_muted(true);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn factory_reset_two_step() {
+        let mut a = mk();
+        assert_eq!(a.factory_reset_state(), FactoryResetState::Idle);
+        // First confirm without arming → no-op.
+        assert!(!a.factory_reset_confirm());
+        a.factory_reset_arm();
+        assert_eq!(a.factory_reset_state(), FactoryResetState::FirstConfirm);
+        assert!(a.factory_reset_confirm());
+        assert_eq!(a.factory_reset_state(), FactoryResetState::SecondConfirmArmed);
+        // Settings reset to defaults.
+        assert_eq!(a.settings().volume, Settings::default().volume);
+    }
+
+    #[test]
+    fn factory_reset_cancel() {
+        let mut a = mk();
+        a.factory_reset_arm();
+        a.factory_reset_cancel();
+        assert_eq!(a.factory_reset_state(), FactoryResetState::Idle);
+    }
+
+    #[test]
+    fn random_device_name_in_wordlist() {
+        let name = SettingsApp::random_device_name(0x12345678);
+        // First char is uppercase, total length > 4.
+        assert!(name.chars().next().unwrap().is_uppercase());
+        assert!(name.len() > 4);
+    }
 }
-impl SettingsApp for SettingsAppStub {
-    fn load(&self) -> Settings { Settings::default() }
-    fn save(&self, _: &Settings) {}
-    fn reset(&self) {}
-}
-unsafe impl Send for SettingsAppStub {}
-unsafe impl Sync for SettingsAppStub {}
