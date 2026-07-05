@@ -6,4 +6,7 @@
 #![allow(unused_imports)]
 
 pub mod crypto;
+pub mod display;
+pub mod input;
+pub mod power;
 pub mod storage;
