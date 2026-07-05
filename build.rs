@@ -9,9 +9,13 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
-    // 1. Compile slint UI → Rust bindings.
-    //    The esp-idf target is auto-detected by slint_build; backend-esp-idf feature
-    //    selects the embedded renderer at runtime.
+    // 1. Compile slint UI → Rust bindings (compile-time validation only).
+    //    The slint *runtime* backend (custom `slint::platform::Platform` driving
+    //    ST7789) is wired up in change 02 (hal-bsp-drivers). slint has no
+    //    `backend-esp-idf` cargo feature; the embedded renderer is selected by
+    //    passing `slint_build::CompilerConfiguration::default()` (which defaults
+    //    to the software renderer on `target_os = "espidf"`) — but the runtime
+    //    crate is not even a dependency in change 01 (see Cargo.toml).
     slint_build::compile("ui/boot.slint").expect("slint_build::compile(ui/boot.slint) failed");
 
     // 2. Drive ESP-IDF (picks up sdkconfig.defaults + partitions.csv).
