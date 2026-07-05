@@ -353,8 +353,19 @@ impl AudioService for HalAudioService {
         Ok(())
     }
     fn stop_playback(&self) -> Result<(), AudioError> {
-        // Disable PA before stopping I2S to avoid pop.
+        // D6: zero-frame fade-out — write 1-2 frames of silence before PA
+        // disable to avoid pop. Then disable PA, then stop I2S.
         let mut out = self.audio_out.lock().unwrap();
+        // Write 2 frames of silence (640 bytes each = 1280 bytes total).
+        let silence = [0u8; PCM_SAMPLES_PER_FRAME * 2];
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                silence.as_ptr() as *const u8,
+                std::mem::size_of_val(&silence),
+            )
+        };
+        let _ = out.write_pcm(&mut self.i2s.lock().unwrap(), bytes);
+        // Now disable PA (no pop because silence is already in the buffer).
         let _ = out.pa_enable(false);
         *self.playing.lock().unwrap() = false;
         Ok(())

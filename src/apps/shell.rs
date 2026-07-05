@@ -144,6 +144,13 @@ impl Launcher {
                 InputDispatch::ToggledMute(self.settings.muted)
             }
             InputEvent::BootShortTap => InputDispatch::ConsumedByLauncher,
+            // BOOT long-press → global PTT routing (task 6.1-7.2). Regardless
+            // of foreground app, route to IntercomApp as PttPress. The
+            // `screen_was_off` flag is preserved for D8 screen-off bypass.
+            InputEvent::BootPress { screen_was_off } => {
+                InputDispatch::ForwardedPttPress { screen_was_off: *screen_was_off }
+            }
+            InputEvent::BootRelease => InputDispatch::ForwardedPttRelease,
             _ => InputDispatch::ForwardedToApp(self.foreground),
         }
     }
@@ -187,6 +194,9 @@ impl Launcher {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputDispatch {
     ForwardedToApp(AppId),
+    /// BOOT long-press / release routed to global PTT handler (task 6.1-7.2).
+    ForwardedPttPress { screen_was_off: bool },
+    ForwardedPttRelease,
     OpenedOverlay(Overlay),
     ClosedOverlay,
     ToggledMute(bool),

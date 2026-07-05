@@ -90,12 +90,23 @@ impl IntercomApp {
     }
 
     /// Translate UI input event into VoiceEvent for the PTT machine.
+    /// Touch Down → PttPress (task 9.1: touch-PTT entry).
+    /// Touch Up → PttRelease (task 9.2).
+    /// `screen_was_off` is always false for touch PTT — the ScreenPolicy
+    /// consumes the first wake touch, so by the time we get here the screen
+    /// is on.
     fn input_to_voice_event(ev: &InputEvent) -> Option<VoiceEvent> {
         match ev {
             InputEvent::BootPress { screen_was_off } => Some(VoiceEvent::PttPress {
                 screen_was_off: *screen_was_off,
             }),
             InputEvent::BootRelease => Some(VoiceEvent::PttRelease),
+            InputEvent::Touch(crate::hal::touch::TouchEvent::Down { .. }) => {
+                Some(VoiceEvent::PttPress { screen_was_off: false })
+            }
+            InputEvent::Touch(crate::hal::touch::TouchEvent::Up { .. }) => {
+                Some(VoiceEvent::PttRelease)
+            }
             _ => None,
         }
     }

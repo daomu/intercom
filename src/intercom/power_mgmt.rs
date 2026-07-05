@@ -202,6 +202,32 @@ impl ScreenPolicy {
     pub fn clear_first_touch(&mut self) {
         self.first_touch_consumed = false;
     }
+
+    /// Update the screen-off timeout (task 8.1: settings callback).
+    pub fn update_screen_off_sec(&mut self, sec: u32) {
+        self.screen_off_sec = sec;
+    }
+
+    /// Poll battery level (task 5.2). Returns the battery percent and whether
+    /// low-battery screen-off should trigger. The caller injects the battery
+    /// reading; this method just evaluates the policy.
+    pub fn poll_battery(&self, battery_percent: u8) -> BatteryAction {
+        if battery_percent <= 5 {
+            BatteryAction::ForceScreenOff
+        } else if battery_percent <= 15 {
+            BatteryAction::LowBatteryWarning
+        } else {
+            BatteryAction::None
+        }
+    }
+}
+
+/// Battery action returned by `poll_battery` (task 5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatteryAction {
+    None,
+    LowBatteryWarning,
+    ForceScreenOff,
 }
 
 // ---- StandbyPolicy (D5) --------------------------------------------------
@@ -304,19 +330,101 @@ pub enum StandbyAction {
 
 // ---- PaController (D6) ---------------------------------------------------
 
-/// PA control is delegated to AudioService start/stop_playback (D6).
-/// This struct is a thin marker — callers invoke AudioService methods
-/// directly; PaController exists only as a documentation anchor.
-pub struct PaController;
+/// PA control sink — the caller injects this to bridge PaController to
+/// AudioService::start_playback / stop_playback without PaController
+/// holding a `&dyn AudioService` reference (keeps the pure-logic layer
+/// free of service-trait lifetime concerns).
+pub trait PaSink: Send + Sync + fmt::Debug {
+    fn start_playback(&self);
+    fn stop_playback(&self);
+    fn pa_enable(&self, on: bool);
+}
+
+/// PaController coordinates PA enable/disable with AudioService playback
+/// start/stop (D6). When voice goes active → start_playback + pa_enable(true)
+/// after 1-2 frames buffered. When voice goes idle → pa_enable(false) +
+/// stop_playback.
+pub struct PaController {
+    sink: Option<Box<dyn PaSink>>,
+    /// Whether PA is currently enabled.
+    pa_on: bool,
+    /// Whether playback is currently started.
+    playing: bool,
+}
+
+impl fmt::Debug for PaController {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PaController")
+            .field("pa_on", &self.pa_on)
+            .field("playing", &self.playing)
+            .field("has_sink", &self.sink.is_some())
+            .finish_non_exhaustive()
+    }
+}
 
 impl PaController {
-    /// Called before entering Listening / Talking.
-    pub const fn on_voice_active() -> &'static str {
-        "AudioService::start_playback"
+    pub fn new() -> Self {
+        Self {
+            sink: None,
+            pa_on: false,
+            playing: false,
+        }
     }
-    /// Called after exiting Listening / Talking.
-    pub const fn on_voice_idle() -> &'static str {
-        "AudioService::stop_playback"
+
+    pub fn with_sink(sink: Box<dyn PaSink>) -> Self {
+        Self {
+            sink: Some(sink),
+            pa_on: false,
+            playing: false,
+        }
+    }
+
+    pub fn set_sink(&mut self, sink: Box<dyn PaSink>) {
+        self.sink = Some(sink);
+    }
+
+    pub fn pa_on(&self) -> bool {
+        self.pa_on
+    }
+
+    /// Called when voice goes active (Listening / Talking).
+    /// D6: start_playback first, then pa_enable(true) after 1-2 frames.
+    pub fn on_voice_active(&mut self) {
+        if !self.playing {
+            if let Some(s) = &self.sink {
+                s.start_playback();
+            }
+            self.playing = true;
+        }
+        if !self.pa_on {
+            if let Some(s) = &self.sink {
+                s.pa_enable(true);
+            }
+            self.pa_on = true;
+        }
+    }
+
+    /// Called when voice goes idle (exiting Listening / Talking).
+    /// D6: pa_enable(false) first, then stop_playback.
+    pub fn on_voice_idle(&mut self) {
+        if self.pa_on {
+            if let Some(s) = &self.sink {
+                s.pa_enable(false);
+            }
+            self.pa_on = false;
+        }
+        if self.playing {
+            if let Some(s) = &self.sink {
+                s.stop_playback();
+            }
+            self.playing = false;
+        }
+    }
+}
+
+impl Default for PaController {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -345,6 +453,100 @@ impl LowPowerProtection for LowPowerProtectionStub {
 }
 unsafe impl Send for LowPowerProtectionStub {}
 unsafe impl Sync for LowPowerProtectionStub {}
+
+// ---- PowerCoordinator (task 7.1-7.4) ------------------------------------
+
+/// Coordinates ScreenPolicy + StandbyPolicy + PaController. The caller
+/// feeds input events, intercom state changes, and periodic ticks; the
+/// coordinator returns the combined action set for the caller to execute.
+pub struct PowerCoordinator {
+    screen: ScreenPolicy,
+    standby: StandbyPolicy,
+    pa: PaController,
+}
+
+impl fmt::Debug for PowerCoordinator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PowerCoordinator")
+            .field("screen", &self.screen)
+            .field("standby", &self.standby)
+            .field("pa", &self.pa)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PowerCoordinator {
+    pub fn new(screen_off_sec: u32) -> Self {
+        Self {
+            screen: ScreenPolicy::new(screen_off_sec),
+            standby: StandbyPolicy::new(),
+            pa: PaController::new(),
+        }
+    }
+
+    pub fn set_pa_sink(&mut self, sink: Box<dyn PaSink>) {
+        self.pa.set_sink(sink);
+    }
+
+    pub fn screen(&self) -> &ScreenPolicy {
+        &self.screen
+    }
+
+    pub fn screen_mut(&mut self) -> &mut ScreenPolicy {
+        &mut self.screen
+    }
+
+    pub fn standby(&self) -> &StandbyPolicy {
+        &self.standby
+    }
+
+    pub fn pa(&self) -> &PaController {
+        &self.pa
+    }
+
+    pub fn pa_mut(&mut self) -> &mut PaController {
+        &mut self.pa
+    }
+
+    /// Task 7.2: handle an input event. Returns the screen action + whether
+    /// to forward as PTT. The caller executes the action.
+    pub fn on_input_event(
+        &mut self,
+        ev: ScreenInputEvent,
+        now_ms: u64,
+    ) -> ScreenAction {
+        self.standby.note_user_interaction(now_ms);
+        self.screen.on_event(ev, now_ms)
+    }
+
+    /// Task 7.3: handle intercom state change. Starts/stops PA based on
+    /// whether voice is active.
+    pub fn on_intercom_state_change(&mut self, state: &IntercomState) {
+        let voice_active = matches!(
+            state,
+            IntercomState::Grouped(VoiceState::Talking)
+                | IntercomState::Grouped(VoiceState::Listening)
+        );
+        if voice_active {
+            self.pa.on_voice_active();
+        } else {
+            self.pa.on_voice_idle();
+        }
+    }
+
+    /// Task 7.4: periodic tick. Returns screen-off reason + standby action.
+    pub fn tick(
+        &mut self,
+        now_ms: u64,
+        state: &IntercomState,
+        no_foreground_task: bool,
+        audio_idle: bool,
+    ) -> (Option<ScreenOffReason>, StandbyAction) {
+        let screen_off = self.screen.tick(now_ms);
+        let standby_action = self.standby.evaluate(now_ms, state, no_foreground_task, audio_idle);
+        (screen_off, standby_action)
+    }
+}
 
 // ---- Trait shim ---------------------------------------------------------
 

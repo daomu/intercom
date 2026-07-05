@@ -11,9 +11,13 @@
 
 use std::fmt;
 
+use crate::board_profile::BoardProfile;
 use crate::intercom::state::{
     HostPhase, IntercomMode, IntercomState, JoinPhase, VoiceState,
 };
+
+/// Schema version mismatch reason code (D10 / §19.2).
+pub const PAIR_JOIN_REASON_INCOMPATIBLE: u8 = BoardProfile::PAIR_JOIN_REASON_INCOMPATIBLE;
 
 // ---- Failure codes (D10) -------------------------------------------------
 
@@ -77,9 +81,11 @@ pub enum PairingEvent {
         rssi_4bar: u8,
     },
     /// Network: Host received a join request.
+    /// `ver` is the schema version from the PAIR_JOIN_REQ header (task 2.3).
     JoinReqReceived {
         join_mac: [u8; 6],
         join_pub_key: [u8; 32],
+        ver: u8,
     },
     /// Network: Join received a join ack.
     JoinAckReceived {
@@ -147,8 +153,13 @@ pub enum PairingAction {
     SendChannelSwitchAck { status: u8 },
     ClearPeers,
     SetChannel { channel: u8 },
-    AddPeer { mac: [u8; 6], lmk: [u8; 16] },
-    SaveGroup,
+    /// Add a peer with the peer's public key; caller derives the LMK via
+    /// `CryptoService::derive_lmk(my_priv, peer_pub)` and calls
+    /// `NetworkService::add_peer(mac, Some(&lmk))`.
+    AddPeer { mac: [u8; 6], peer_pub_key: [u8; 32] },
+    SaveGroup {
+        info: PairingGroupInfo,
+    },
     ScheduleDirectoryBroadcasts,
     ScheduleSwitch { offset_ms: u16 },
     Fail(PairingFailure),
@@ -176,12 +187,84 @@ pub struct DiscoveredHost {
     pub last_seen_ms: u64,
 }
 
+// ---- HostInfo (D9: UI data contract) -------------------------------------
+
+/// UI-facing host descriptor (task 1.4). `name` defaults to
+/// `"Host-" + mac_suffix4` when the host didn't set a device name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HostInfo {
+    pub name: String,
+    pub mac_suffix4: String,
+    pub rssi_4bar: u8,
+    pub cur_members: u8,
+    pub max_members: u8,
+    pub mode: IntercomMode,
+    pub joinable: bool,
+    pub last_seen_ms: u64,
+}
+
+impl HostInfo {
+    /// Build a `HostInfo` from a `DiscoveredHost`, generating the default
+    /// name and mac_suffix4 string (task 8.3 / 8.4).
+    pub fn from_discovered(h: &DiscoveredHost) -> Self {
+        let suffix = format_mac_suffix4(&h.host_mac);
+        Self {
+            name: format!("Host-{}", suffix),
+            mac_suffix4: suffix,
+            rssi_4bar: h.rssi_4bar,
+            cur_members: h.cur_members,
+            max_members: h.max_members,
+            mode: h.mode,
+            joinable: h.joinable,
+            last_seen_ms: h.last_seen_ms,
+        }
+    }
+}
+
+// ---- GroupInfo (task 1.5: save_group payload) ----------------------------
+
+/// Group descriptor emitted in `SaveGroup` so the caller can persist it
+/// via `StorageService::save_group`. Carries the data the caller needs to
+/// reconstruct `storage::GroupInfo`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PairingGroupInfo {
+    pub my_priv_key: [u8; 32],
+    pub peers: Vec<([u8; 6], [u8; 32])>,
+    pub channel: u8,
+    pub mode: IntercomMode,
+}
+
+// ---- Helpers (task 8.2 / 8.3 / 8.4) --------------------------------------
+
+/// Format the last 4 bytes of a MAC as a lowercase hex string (task 8.3).
+/// e.g. `[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]` → `"eeff"`.
+pub fn format_mac_suffix4(mac: &[u8; 6]) -> String {
+    format!("{:02x}{:02x}", mac[4], mac[5])
+}
+
+/// RSSI → 4-bar mapping with ±3 dB hysteresis (task 8.2 / §13.2).
+/// Delegates to `heartbeat::rssi_to_bars` to reuse the tested hysteresis
+/// implementation.
+pub fn rssi_to_4bar(smoothed_rssi: i32, current_bars: u8) -> u8 {
+    crate::intercom::heartbeat::rssi_to_bars(smoothed_rssi, current_bars)
+}
+
+/// Validate a peer public key (task 2.3: non all-0, non all-0xFF, len 32).
+pub fn is_valid_pub_key(pub_key: &[u8; 32]) -> bool {
+    let all_zero = pub_key.iter().all(|&b| b == 0);
+    let all_ff = pub_key.iter().all(|&b| b == 0xFF);
+    !(all_zero || all_ff)
+}
+
 // ---- Machine -------------------------------------------------------------
 
 pub struct PairingMachine {
     state: IntercomState,
     my_mac: [u8; 6],
     my_pub_key: [u8; 32],
+    /// Private key — caller fills at construction (or via `set_my_priv_key`).
+    /// Needed for `SaveGroup` and LMK derivation by caller.
+    my_priv_key: [u8; 32],
     mode: IntercomMode,
     max_members: u8,
     /// Collected peers (Host path) or selected host (Join path).
@@ -197,6 +280,9 @@ pub struct PairingMachine {
     acks_received: u8,
     /// Count of DIRECTORY_BROADCAST sent (Host).
     directory_broadcasts_sent: u8,
+    /// Radio busy flag (D4.5 / D6.6): true while DIRECTORY_BROADCAST +
+    /// channel switch is in progress. Blocks other radio operations.
+    radio_busy: bool,
 }
 
 impl fmt::Debug for PairingMachine {
@@ -211,10 +297,16 @@ impl fmt::Debug for PairingMachine {
 
 impl PairingMachine {
     pub fn new(my_mac: [u8; 6], my_pub_key: [u8; 32]) -> Self {
+        Self::with_priv_key(my_mac, my_pub_key, [0u8; 32])
+    }
+
+    /// Construct with the private key filled in (needed for SaveGroup).
+    pub fn with_priv_key(my_mac: [u8; 6], my_pub_key: [u8; 32], my_priv_key: [u8; 32]) -> Self {
         Self {
             state: IntercomState::Idle,
             my_mac,
             my_pub_key,
+            my_priv_key,
             mode: IntercomMode::Clear,
             max_members: 4,
             members: Vec::new(),
@@ -224,7 +316,13 @@ impl PairingMachine {
             switch_offset_ms: 0,
             acks_received: 0,
             directory_broadcasts_sent: 0,
+            radio_busy: false,
         }
+    }
+
+    /// Set/update the private key (caller obtains it from CryptoService).
+    pub fn set_my_priv_key(&mut self, k: [u8; 32]) {
+        self.my_priv_key = k;
     }
 
     pub fn state(&self) -> &IntercomState {
@@ -235,8 +333,20 @@ impl PairingMachine {
         &self.discovered_hosts
     }
 
+    /// UI-facing host list (task 8.1: `get_host_list() -> Vec<HostInfo>`).
+    pub fn host_list(&self) -> Vec<HostInfo> {
+        self.discovered_hosts
+            .iter()
+            .map(HostInfo::from_discovered)
+            .collect()
+    }
+
     pub fn members(&self) -> &[([u8; 6], [u8; 32])] {
         &self.members
+    }
+
+    pub fn radio_busy(&self) -> bool {
+        self.radio_busy
     }
 
     /// Add or update a discovered host (D9: dedup by host_mac, 5s expiry
@@ -292,10 +402,27 @@ impl PairingMachine {
             }
             (
                 IntercomState::Hosting(HostPhase::Discovering),
-                PairingEvent::JoinReqReceived { join_mac, join_pub_key },
+                PairingEvent::JoinReqReceived { join_mac, join_pub_key, ver },
             ) => {
-                // Auto-accept (cur_members was 0 at host start; we can accept up to max-1 peers).
-                if self.members.len() >= (self.max_members as usize).saturating_sub(1) {
+                // Schema version check (task 2.3): ver must match SCHEMA_VER.
+                if ver as u16 != BoardProfile::SCHEMA_VER {
+                    actions.push(PairingAction::SendJoinAck {
+                        host_mac: self.my_mac,
+                        host_pub_key: self.my_pub_key,
+                        join_mac,
+                        accepted: false,
+                        reason: JoinAckReason::SchemaIncompatible,
+                    });
+                } else if !is_valid_pub_key(&join_pub_key) {
+                    // pub_key validity check (task 2.3: non all-0/0xFF).
+                    actions.push(PairingAction::SendJoinAck {
+                        host_mac: self.my_mac,
+                        host_pub_key: self.my_pub_key,
+                        join_mac,
+                        accepted: false,
+                        reason: JoinAckReason::SchemaIncompatible,
+                    });
+                } else if self.members.len() >= (self.max_members as usize).saturating_sub(1) {
                     actions.push(PairingAction::SendJoinAck {
                         host_mac: self.my_mac,
                         host_pub_key: self.my_pub_key,
@@ -318,9 +445,25 @@ impl PairingMachine {
             }
             (
                 IntercomState::Hosting(HostPhase::CollectingPeers),
-                PairingEvent::JoinReqReceived { join_mac, join_pub_key },
+                PairingEvent::JoinReqReceived { join_mac, join_pub_key, ver },
             ) => {
-                if self.members.len() >= (self.max_members as usize).saturating_sub(1) {
+                if ver as u16 != BoardProfile::SCHEMA_VER {
+                    actions.push(PairingAction::SendJoinAck {
+                        host_mac: self.my_mac,
+                        host_pub_key: self.my_pub_key,
+                        join_mac,
+                        accepted: false,
+                        reason: JoinAckReason::SchemaIncompatible,
+                    });
+                } else if !is_valid_pub_key(&join_pub_key) {
+                    actions.push(PairingAction::SendJoinAck {
+                        host_mac: self.my_mac,
+                        host_pub_key: self.my_pub_key,
+                        join_mac,
+                        accepted: false,
+                        reason: JoinAckReason::SchemaIncompatible,
+                    });
+                } else if self.members.len() >= (self.max_members as usize).saturating_sub(1) {
                     actions.push(PairingAction::SendJoinAck {
                         host_mac: self.my_mac,
                         host_pub_key: self.my_pub_key,
@@ -360,6 +503,8 @@ impl PairingMachine {
                 self.target_channel = target_channel;
                 self.directory_broadcasts_sent = 0;
                 self.acks_received = 0;
+                // D4.5: radio busy while DIRECTORY_BROADCAST + switch in flight.
+                self.radio_busy = true;
                 self.state = IntercomState::Hosting(HostPhase::Frozen);
                 actions.push(PairingAction::ScheduleDirectoryBroadcasts);
                 // Immediately send first broadcast (index 0).
@@ -391,14 +536,14 @@ impl PairingMachine {
                 IntercomState::Hosting(HostPhase::Frozen),
                 PairingEvent::SwitchDeadline,
             ) => {
-                // D5: clear_peers → set_channel → re-add peers.
+                // D5: clear_peers → set_channel → re-add peers with real pub_key.
                 actions.push(PairingAction::ClearPeers);
                 actions.push(PairingAction::SetChannel { channel: self.target_channel });
-                for (mac, _pub) in &self.members {
-                    // Caller derives the LMK; we just emit the action with a placeholder.
+                for (mac, peer_pub) in &self.members {
+                    // Caller derives LMK via CryptoService::derive_lmk(my_priv, peer_pub).
                     actions.push(PairingAction::AddPeer {
                         mac: *mac,
-                        lmk: [0u8; 16], // placeholder — caller fills via derive_lmk
+                        peer_pub_key: *peer_pub,
                     });
                 }
                 self.state = IntercomState::Hosting(HostPhase::SwitchingChannel);
@@ -409,7 +554,16 @@ impl PairingMachine {
             ) => {
                 self.acks_received += 1;
                 if self.acks_received >= self.members.len() as u8 {
-                    actions.push(PairingAction::SaveGroup);
+                    actions.push(PairingAction::SaveGroup {
+                        info: PairingGroupInfo {
+                            my_priv_key: self.my_priv_key,
+                            peers: self.members.clone(),
+                            channel: self.target_channel,
+                            mode: self.mode,
+                        },
+                    });
+                    // D6.6: release radio_busy on entering Grouped.
+                    self.radio_busy = false;
                     self.state = IntercomState::Grouped(VoiceState::Idle);
                     actions.push(PairingAction::EnterGrouped);
                 }
@@ -419,7 +573,15 @@ impl PairingMachine {
                 PairingEvent::AckTimeout,
             ) => {
                 // D6: enter Grouped even if not all ACKs received.
-                actions.push(PairingAction::SaveGroup);
+                actions.push(PairingAction::SaveGroup {
+                    info: PairingGroupInfo {
+                        my_priv_key: self.my_priv_key,
+                        peers: self.members.clone(),
+                        channel: self.target_channel,
+                        mode: self.mode,
+                    },
+                });
+                self.radio_busy = false;
                 self.state = IntercomState::Grouped(VoiceState::Idle);
                 actions.push(PairingAction::EnterGrouped);
             }
@@ -437,6 +599,7 @@ impl PairingMachine {
                 | IntercomState::Hosting(HostPhase::CollectingPeers),
                 PairingEvent::Cancel,
             ) => {
+                self.radio_busy = false;
                 self.state = IntercomState::Idle;
             }
 
@@ -545,14 +708,22 @@ impl PairingMachine {
             ) => {
                 actions.push(PairingAction::ClearPeers);
                 actions.push(PairingAction::SetChannel { channel: self.target_channel });
-                for (mac, _pub) in &self.members {
+                for (mac, peer_pub) in &self.members {
                     actions.push(PairingAction::AddPeer {
                         mac: *mac,
-                        lmk: [0u8; 16],
+                        peer_pub_key: *peer_pub,
                     });
                 }
                 actions.push(PairingAction::SendChannelSwitchAck { status: 0 });
-                actions.push(PairingAction::SaveGroup);
+                actions.push(PairingAction::SaveGroup {
+                    info: PairingGroupInfo {
+                        my_priv_key: self.my_priv_key,
+                        peers: self.members.clone(),
+                        channel: self.target_channel,
+                        mode: self.mode,
+                    },
+                });
+                self.radio_busy = false;
                 self.state = IntercomState::Grouped(VoiceState::Idle);
                 actions.push(PairingAction::EnterGrouped);
             }
@@ -563,6 +734,7 @@ impl PairingMachine {
                 | IntercomState::Joining(JoinPhase::Requesting),
                 PairingEvent::Cancel,
             ) => {
+                self.radio_busy = false;
                 self.state = IntercomState::Idle;
             }
 
@@ -633,6 +805,7 @@ mod tests {
         let o = m.handle(PairingEvent::JoinReqReceived {
             join_mac: [10, 20, 30, 40, 50, 60],
             join_pub_key: [0xBB; 32],
+            ver: BoardProfile::SCHEMA_VER,
         });
         assert_eq!(o.new_state, IntercomState::Hosting(HostPhase::CollectingPeers));
         assert!(o.actions.iter().any(|a| matches!(
@@ -666,12 +839,17 @@ mod tests {
         assert_eq!(o.new_state, IntercomState::Hosting(HostPhase::SwitchingChannel));
         assert!(o.actions.iter().any(|a| matches!(a, PairingAction::ClearPeers)));
         assert!(o.actions.iter().any(|a| matches!(a, PairingAction::SetChannel { channel: 11 })));
+        assert!(o.actions.iter().any(|a| matches!(
+            a,
+            PairingAction::AddPeer { peer_pub_key: [0xBB; 32], .. }
+        )));
 
         // ACK from join → enter Grouped.
         let o = m.handle(PairingEvent::ChannelSwitchAckReceived { sender_id: 0, status: 0 });
         assert_eq!(o.new_state, IntercomState::Grouped(VoiceState::Idle));
-        assert!(o.actions.iter().any(|a| matches!(a, PairingAction::SaveGroup)));
+        assert!(o.actions.iter().any(|a| matches!(a, PairingAction::SaveGroup { .. })));
         assert!(o.actions.iter().any(|a| matches!(a, PairingAction::EnterGrouped)));
+        assert!(!m.radio_busy());
     }
 
     #[test]
@@ -773,6 +951,7 @@ mod tests {
         m.handle(PairingEvent::JoinReqReceived {
             join_mac: [10; 6],
             join_pub_key: [0xBB; 32],
+            ver: BoardProfile::SCHEMA_VER,
         });
         m.handle(PairingEvent::HostConfirm { switch_offset_ms: 500, target_channel: 11 });
         m.handle(PairingEvent::SwitchDeadline);
@@ -839,15 +1018,83 @@ mod tests {
         m.handle(PairingEvent::JoinReqReceived {
             join_mac: [10; 6],
             join_pub_key: [0xBB; 32],
+            ver: BoardProfile::SCHEMA_VER,
         });
         // Second join rejected (max_members=2 means 1 peer + 1 host).
         let o = m.handle(PairingEvent::JoinReqReceived {
             join_mac: [20; 6],
             join_pub_key: [0xCC; 32],
+            ver: BoardProfile::SCHEMA_VER,
         });
         assert!(o.actions.iter().any(|a| matches!(
             a,
             PairingAction::SendJoinAck { accepted: false, reason: JoinAckReason::Full, .. }
         )));
+    }
+
+    #[test]
+    fn schema_mismatch_rejects_with_incompatible() {
+        let mut m = mk();
+        m.handle(PairingEvent::StartHost { mode: IntercomMode::Clear, max_members: 4 });
+        let o = m.handle(PairingEvent::JoinReqReceived {
+            join_mac: [10; 6],
+            join_pub_key: [0xBB; 32],
+            ver: 99, // mismatched schema version
+        });
+        assert!(o.actions.iter().any(|a| matches!(
+            a,
+            PairingAction::SendJoinAck {
+                accepted: false, reason: JoinAckReason::SchemaIncompatible, ..
+            }
+        )));
+    }
+
+    #[test]
+    fn invalid_pubkey_rejects() {
+        let mut m = mk();
+        m.handle(PairingEvent::StartHost { mode: IntercomMode::Clear, max_members: 4 });
+        let o = m.handle(PairingEvent::JoinReqReceived {
+            join_mac: [10; 6],
+            join_pub_key: [0x00; 32], // all-zero → invalid
+            ver: BoardProfile::SCHEMA_VER,
+        });
+        assert!(o.actions.iter().any(|a| matches!(
+            a,
+            PairingAction::SendJoinAck {
+                accepted: false, reason: JoinAckReason::SchemaIncompatible, ..
+            }
+        )));
+    }
+
+    #[test]
+    fn host_info_from_discovered() {
+        let h = DiscoveredHost {
+            host_mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            host_pub_key: [0x11; 32],
+            mode: IntercomMode::Clear,
+            cur_members: 1,
+            max_members: 4,
+            joinable: true,
+            rssi_4bar: 3,
+            last_seen_ms: 1234,
+        };
+        let info = HostInfo::from_discovered(&h);
+        assert_eq!(info.mac_suffix4, "eeff");
+        assert_eq!(info.name, "Host-eeff");
+        assert_eq!(info.rssi_4bar, 3);
+        assert!(info.joinable);
+    }
+
+    #[test]
+    fn format_mac_suffix4_lower_hex() {
+        assert_eq!(format_mac_suffix4(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]), "eeff");
+        assert_eq!(format_mac_suffix4(&[0, 0, 0, 0, 0x12, 0x34]), "1234");
+    }
+
+    #[test]
+    fn valid_pubkey_check() {
+        assert!(!is_valid_pub_key(&[0u8; 32]));
+        assert!(!is_valid_pub_key(&[0xFFu8; 32]));
+        assert!(is_valid_pub_key(&[0xAAu8; 32]));
     }
 }

@@ -129,10 +129,11 @@ impl VoicePttMachine {
 
         match (prev, event) {
             // ---- PTT press from Idle ----
-            (Idle, PttPress { screen_was_off }) => {
-                if !screen_was_off {
-                    // (Screen is already on; no action needed.)
-                }
+            // D8: screen_was_off=true means PTT bypass — don't wake screen,
+            // just proceed with PTT. screen_was_off=false is normal PTT.
+            // Either way, the PTT flow is the same; the ScreenOn action is
+            // NOT emitted (caller handles wake separately if needed).
+            (Idle, PttPress { screen_was_off: _ }) => {
                 match self.mode {
                     IntercomMode::Clear => {
                         // clear-mode: send TALK_STATE(action=1), enter arbitration.

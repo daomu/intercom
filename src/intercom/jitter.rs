@@ -21,12 +21,18 @@ pub const INITIAL_WATER: usize = 3;
 pub const WATER_FLOOR: usize = 6;
 /// Hard cap for dynamic max_water (== RING_CAP).
 pub const WATER_HARD_CAP: usize = 10;
-/// Per-route attenuation (PRD §13.2 / design D6).
-pub const MIX_ATTEN: i32 = 7; // /10
 /// Max simultaneous routes mixed (PRD §13.2 cap 3).
 pub const MIX_MAX_ROUTES: usize = 3;
 /// PLC silence floor threshold (consecutive lost > 4 → silence).
 pub const PLC_SILENCE_THRESHOLD: u8 = 4;
+/// Clock-drift correction window (10s per D8).
+pub const DRIFT_WINDOW_MS: u64 = 10_000;
+/// Cooldown between drift corrections (10s per D8).
+pub const DRIFT_COOLDOWN_MS: u64 = 10_000;
+/// Low-water correction threshold: drop 1 frame when water < this.
+pub const DRIFT_LOW_WATER: usize = 2;
+/// High-water correction threshold: insert 1 PLC frame when water > this.
+pub const DRIFT_HIGH_WATER: usize = 9;
 
 /// Sentinel for "no seq seen yet" — ensures first seq=0 isn't dropped.
 const SEQ_NONE: u16 = 0xFFFF;
@@ -69,6 +75,10 @@ pub struct JitterRing {
     primed: bool,
     /// EMA of observed water level peaks, used to adjust max_water.
     observed_ema: u32,
+    /// 10s windowed water samples for clock-drift correction (D8).
+    drift_samples: [(u64, usize); 32],
+    drift_sample_count: usize,
+    drift_last_correction_ms: u64,
 }
 
 impl Default for JitterRing {
@@ -89,6 +99,9 @@ impl JitterRing {
             max_water: WATER_FLOOR,
             primed: false,
             observed_ema: 0,
+            drift_samples: [(0u64, 0usize); 32],
+            drift_sample_count: 0,
+            drift_last_correction_ms: 0,
         }
     }
 
@@ -131,6 +144,51 @@ impl JitterRing {
         let target = (self.observed_ema / 8) as usize + 2;
         let new = target.clamp(WATER_FLOOR, WATER_HARD_CAP);
         self.max_water = new;
+    }
+
+    /// Sample water level for clock-drift correction (D8). Call on each tick.
+    /// Records (now_ms, water_level) into a ring; when 10s windowed mean
+    /// indicates persistent drift, returns a correction action.
+    pub fn observe_drift(&mut self, now_ms: u64) -> DriftCorrection {
+        if self.drift_sample_count < 32 {
+            self.drift_samples[self.drift_sample_count] = (now_ms, self.count);
+            self.drift_sample_count += 1;
+        } else {
+            // Ring-rewrite oldest.
+            let idx = (now_ms / 312) as usize % 32;
+            self.drift_samples[idx] = (now_ms, self.count);
+        }
+        // Cooldown: don't correct more than once per DRIFT_COOLDOWN_MS.
+        if now_ms < self.drift_last_correction_ms + DRIFT_COOLDOWN_MS {
+            return DriftCorrection::None;
+        }
+        // Compute 10s windowed mean water level.
+        let window_start = now_ms.saturating_sub(DRIFT_WINDOW_MS);
+        let mut sum: u64 = 0;
+        let mut n: u64 = 0;
+        for &(t, w) in self.drift_samples.iter() {
+            if t >= window_start && t > 0 {
+                sum += w as u64;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return DriftCorrection::None;
+        }
+        let mean = (sum / n) as usize;
+        if mean < DRIFT_LOW_WATER && self.count > 0 {
+            // Low water: our clock is slow vs sender → drop 1 frame to catch up.
+            self.drift_last_correction_ms = now_ms;
+            self.tail = (self.tail + 1) % RING_CAP;
+            self.count = self.count.saturating_sub(1);
+            return DriftCorrection::DroppedFrame;
+        }
+        if mean > DRIFT_HIGH_WATER {
+            // High water: our clock is fast vs sender → insert 1 PLC frame.
+            self.drift_last_correction_ms = now_ms;
+            return DriftCorrection::InsertPlc;
+        }
+        DriftCorrection::None
     }
 
     /// Push a frame. Returns PushResult.
@@ -200,6 +258,9 @@ impl JitterRing {
         self.max_water = WATER_FLOOR;
         self.primed = false;
         self.observed_ema = 0;
+        self.drift_samples = [(0u64, 0usize); 32];
+        self.drift_sample_count = 0;
+        self.drift_last_correction_ms = 0;
     }
 }
 
@@ -209,6 +270,17 @@ pub enum PlcAction {
     Predict,
     /// Skip PLC, output zero PCM (consecutive_lost exceeded threshold).
     SilenceFloor,
+}
+
+/// Clock-drift correction action (D8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriftCorrection {
+    /// No correction needed.
+    None,
+    /// Local clock slow vs sender — dropped 1 frame to catch up.
+    DroppedFrame,
+    /// Local clock fast vs sender — caller should insert 1 PLC frame.
+    InsertPlc,
 }
 
 // ---- Multi-source manager -------------------------------------------------
@@ -265,46 +337,64 @@ impl JitterMixer {
     }
 
     /// Submit decoded PCM for a sender (for mixer use).
+    /// Per spec (task 6.1): the caller should submit this to AudioService
+    /// via `AudioService::submit_pcm(src_id, pcm)`. This method only stores
+    /// the PCM so `active_routes` can rank and return it.
     pub fn submit_pcm(&mut self, sender_id: usize, pcm: [i16; PCM_SAMPLES_PER_FRAME]) {
         if let Some(slot) = self.pending.get_mut(sender_id) {
             *slot = Some(pcm);
         }
     }
 
-    /// Mix the currently-pending PCM streams with fixed 0.7 attenuation per
-    /// route, capped at MIX_MAX_ROUTES. Saturating soft-limiter clips to i16
-    /// range. Clears pending after mixing.
-    pub fn mix(&mut self) -> [i16; PCM_SAMPLES_PER_FRAME] {
-        // Collect non-empty routes; if more than MIX_MAX_ROUTES, keep first 3
-        // (callers should pre-rank, but as a guard we just truncate).
-        let mut routes: Vec<&[i16; PCM_SAMPLES_PER_FRAME]> = self
-            .pending
-            .iter()
-            .filter_map(|s| s.as_ref())
-            .collect();
-        if routes.len() > MIX_MAX_ROUTES {
-            routes.truncate(MIX_MAX_ROUTES);
+    /// Compute a resource-retention score for a sender (D7: stability ×
+    /// duration). Stability = how often water level stayed above INITIAL_WATER
+    /// (approximated by observed_ema). Duration = time since first push.
+    /// Higher score = keep this route when truncating to MIX_MAX_ROUTES.
+    fn route_score(&self, sender_id: usize) -> i32 {
+        let ring = match self.rings.get(sender_id) {
+            Some(r) => r,
+            None => return -1,
+        };
+        let pcm_present = self.pending.get(sender_id).map_or(false, |s| s.is_some());
+        if !pcm_present {
+            return -1;
         }
+        // Stability: observed_ema normalized to 0..100.
+        let stability = (ring.observed_ema / 8) as i32;
+        // Duration weight: more frames seen = higher. Use last_seen_seq as proxy.
+        let duration = ring.last_seen_seq as i32;
+        stability.saturating_add(duration / 100)
+    }
 
-        let mut out = [0i16; PCM_SAMPLES_PER_FRAME];
-        if routes.is_empty() {
-            return out;
-        }
-        let denom = 10i32;
-        for i in 0..PCM_SAMPLES_PER_FRAME {
-            let mut acc: i32 = 0;
-            for r in &routes {
-                acc += (*r)[i] as i32 * MIX_ATTEN / denom;
+    /// Return the active routes (sender_id, pcm) ranked by resource-retention
+    /// score, capped at MIX_MAX_ROUTES. The caller submits each to
+    /// `AudioService::submit_pcm(src_id, pcm)` — AudioService does the
+    /// attenuation/sum/limit per spec (task 6.2). Clears pending after.
+    pub fn active_routes(&mut self) -> Vec<(usize, [i16; PCM_SAMPLES_PER_FRAME])> {
+        let mut scored: Vec<(i32, usize)> = (0..self.rings.len())
+            .map(|i| (self.route_score(i), i))
+            .filter(|(s, _)| *s >= 0)
+            .collect();
+        // Sort descending by score.
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.truncate(MIX_MAX_ROUTES);
+
+        let mut out = Vec::with_capacity(scored.len());
+        for (_, i) in &scored {
+            if let Some(Some(pcm)) = self.pending.get(*i) {
+                out.push((*i, *pcm));
             }
-            // Soft limiter: tanh-like via clamp at ±30000 then i16 clamp.
-            let clamped = acc.clamp(-30000, 30000);
-            out[i] = clamped.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
         }
         // Clear pending — caller is expected to submit fresh PCM each tick.
         for s in self.pending.iter_mut() {
             *s = None;
         }
         out
+    }
+
+    /// Observe clock drift on a sender's ring (D8). Call per-tick.
+    pub fn observe_drift(&mut self, sender_id: usize, now_ms: u64) -> Option<DriftCorrection> {
+        self.rings.get_mut(sender_id).map(|r| r.observe_drift(now_ms))
     }
 
     /// Reset all rings (group leave).
@@ -320,6 +410,54 @@ impl JitterMixer {
     pub fn water_level(&self, sender_id: usize) -> usize {
         self.rings.get(sender_id).map(|r| r.water_level()).unwrap_or(0)
     }
+}
+
+// ---- on_recv_voice main entry (task 10.1) --------------------------------
+
+/// Outcome of `on_recv_voice`: the caller should decode the popped frame
+/// (or run PLC) and submit the resulting PCM to AudioService via the
+/// jitter mixer's `submit_pcm` + `active_routes`.
+#[derive(Debug, Clone)]
+pub struct RecvVoiceOutcome {
+    /// (sender_id, frame) pairs ready for Opus decode.
+    pub decode: Vec<(usize, AudioFrame)>,
+    /// (sender_id, PlcAction) pairs needing PLC (opus_decode(None) or zeros).
+    pub plc: Vec<(usize, PlcAction)>,
+}
+
+impl Default for RecvVoiceOutcome {
+    fn default() -> Self {
+        Self {
+            decode: Vec::new(),
+            plc: Vec::new(),
+        }
+    }
+}
+
+/// Main entry for received voice packet (task 10.1).
+/// Pushes the frame into the sender's ring, then pops all ready frames
+/// across all senders. The caller decodes each popped frame and submits
+/// PCM via `JitterMixer::submit_pcm`, then calls `active_routes` to get
+/// the final mix list for AudioService.
+///
+/// Per spec (task 5.5): jitter does NOT call opus_decode itself — the
+/// caller does that via AudioService. This function only manages buffering.
+pub fn on_recv_voice(
+    mixer: &mut JitterMixer,
+    sender_id: usize,
+    seq: u16,
+    frame: AudioFrame,
+) -> RecvVoiceOutcome {
+    let mut out = RecvVoiceOutcome::default();
+    if mixer.push(sender_id, seq, frame).is_none() {
+        // sender_id out of range — drop.
+        return out;
+    }
+    // Pop all ready frames across all senders (oldest-first by sender_id).
+    while let Some((sid, f)) = mixer.pop_ready() {
+        out.decode.push((sid, f));
+    }
+    out
 }
 
 impl Default for JitterMixer {
@@ -434,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn mixer_attenuates_and_clips() {
+    fn mixer_active_routes_returns_pending() {
         let mut m = JitterMixer::with_capacity(4);
         let mut pcm = [0i16; PCM_SAMPLES_PER_FRAME];
         for s in pcm.iter_mut() {
@@ -443,9 +581,12 @@ mod tests {
         m.submit_pcm(0, pcm);
         m.submit_pcm(1, pcm);
         m.submit_pcm(2, pcm);
-        let mixed = m.mix();
-        // 3 routes × 30000 × 0.7 = 63000 → clamped to 30000 (soft limiter)
-        assert_eq!(mixed[0], 30000);
+        let routes = m.active_routes();
+        // 3 routes returned (≤ MIX_MAX_ROUTES=3).
+        assert_eq!(routes.len(), 3);
+        // Per spec: jitter does NOT attenuate/sum/limit — caller (AudioService) does.
+        // Each route's PCM is unchanged.
+        assert_eq!(routes[0].1[0], 30000);
     }
 
     #[test]
@@ -458,16 +599,30 @@ mod tests {
         for i in 0..4 {
             m.submit_pcm(i, pcm);
         }
-        let mixed = m.mix();
-        // 4 routes submitted but only 3 mixed: 3 × 10000 × 0.7 = 21000
-        assert_eq!(mixed[0], 21000);
+        let routes = m.active_routes();
+        // 4 routes submitted but only 3 returned (MIX_MAX_ROUTES cap).
+        assert_eq!(routes.len(), 3);
     }
 
     #[test]
-    fn mixer_empty_returns_zeros() {
+    fn mixer_empty_returns_empty() {
         let mut m = JitterMixer::with_capacity(4);
-        let mixed = m.mix();
-        assert_eq!(mixed[0], 0);
+        let routes = m.active_routes();
+        assert!(routes.is_empty());
+    }
+
+    #[test]
+    fn on_recv_voice_pops_ready_frames() {
+        let mut m = JitterMixer::with_capacity(4);
+        // Push 3 frames to sender 0 to prime the ring.
+        for i in 1..=3 {
+            let out = on_recv_voice(&mut m, 0, i, mkframe(i, 1));
+            // Before priming, no frames are popped. After priming (3rd push),
+            // the first frame is ready.
+            if i >= 3 {
+                assert!(!out.decode.is_empty());
+            }
+        }
     }
 
     #[test]

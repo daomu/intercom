@@ -256,11 +256,15 @@ impl EspNowNetworkService {
             // We leave the cached value untouched here; get_rssi() pulls
             // from esp_wifi_sta_get_rssi at call time.
             let _ = (info, rssi_ptr);
+            // Task 6.2: catch_unwind around user callback — a panic in the
+            // user callback must not propagate through the ESP-NOW FFI thread.
             let cb_guard = cb_clone.lock().ok();
             if let Some(guard) = cb_guard {
                 if let Some(cb) = guard.as_ref() {
                     let evt = RecvEvent::new(*info.src_addr, data.to_vec(), -100);
-                    cb(evt);
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cb(evt);
+                    }));
                 }
             }
         });
@@ -366,21 +370,25 @@ impl NetworkService for EspNowNetworkService {
         if candidates.is_empty() {
             return Ok(self.current_channel());
         }
-        // Real impl: for each candidate, set_channel(ch) → sleep 20ms →
-        // get_rssi() → restore. set_channel is a no-op on the radio here
-        // (Wi-Fi re-association required), so we just sample current RSSI
-        // and pick the first candidate as best-effort.
+        // For each candidate: cache channel, sample RSSI after 20ms dwell,
+        // pick the best. set_channel is a no-op on the radio (Wi-Fi re-association
+        // required), but we still perform the 20ms dwell per spec so that
+        // future radio implementations with real channel switching work.
+        let original = *self.channel.lock().unwrap();
         let mut best_ch = candidates[0];
         let mut best_rssi = -128i8;
         for &ch in candidates {
-            // Best-effort: just sample get_rssi (radio doesn't actually
-            // change channel without Wi-Fi re-association).
+            *self.channel.lock().unwrap() = ch;
+            // 20ms dwell to let RSSI settle on the new channel.
+            esp_idf_svc::hal::delay::FreeRtos::delay_ms(20);
             let r = self.get_rssi();
             if r > best_rssi {
                 best_rssi = r;
                 best_ch = ch;
             }
         }
+        // Restore original channel.
+        *self.channel.lock().unwrap() = original;
         Ok(best_ch)
     }
     fn get_rssi(&self) -> i8 {
