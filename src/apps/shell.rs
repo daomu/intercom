@@ -9,6 +9,9 @@
 
 use std::fmt;
 
+use crate::apps::view::launcher_view;
+use crate::apps::{App, AppContext, HitTarget, RenderCtx};
+use crate::services::display_buf::Rgb565Buf;
 use crate::services::input::InputEvent;
 use crate::services::storage::Settings;
 
@@ -189,6 +192,11 @@ impl Launcher {
         self.screen_on = true;
         self.last_activity_tick = 0;
     }
+
+    /// Seconds since last user interaction (for standby grace period).
+    pub fn idle_secs(&self) -> u32 {
+        self.last_activity_tick
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +224,35 @@ pub trait AppShell: Send + Sync + fmt::Debug {
     fn launch(&self, app_id: u8);
     fn current_app(&self) -> u8;
     fn back(&self);
+}
+
+// ---- App trait impl (view-layer delegation) -----------------------------
+
+impl App for Launcher {
+    fn id(&self) -> &str {
+        "launcher"
+    }
+    fn title(&self) -> &str {
+        "Launcher"
+    }
+    fn on_enter(&mut self, _ctx: &AppContext) {}
+    fn on_exit(&mut self, _ctx: &AppContext) {}
+    fn on_event(&mut self, _ev: &InputEvent, _ctx: &AppContext) {
+        // Launcher input routing is handled by `dispatch_input` (called
+        // directly by the controller for overlay > foreground > shortcut
+        // priority). The App trait lifecycle no-ops here to avoid
+        // double-dispatch.
+    }
+    fn on_tick(&mut self, _ctx: &AppContext) {
+        // Screen-off timer is advanced by `tick()` (called directly by the
+        // controller, which acts on the returned `LauncherTickAction`).
+    }
+    fn render(&self, fb: &mut Rgb565Buf, ctx: &RenderCtx) {
+        launcher_view::draw_launcher(fb, ctx);
+    }
+    fn hit_test(&self, x: i32, y: i32, _ctx: &RenderCtx) -> Option<HitTarget> {
+        launcher_view::hit_test(x, y)
+    }
 }
 
 #[cfg(test)]

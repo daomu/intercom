@@ -62,7 +62,8 @@ impl LcdDriver {
         RSTPIN: OutputPin + 'static,
         CSPIN: OutputPin + 'static,
     {
-        let bus_config = DriverConfig::new().dma(esp_idf_svc::hal::spi::Dma::Channel1(4096));
+        // ESP32-C6 only supports SPI DMA auto-alloc (no manual Channel1/2).
+        let bus_config = DriverConfig::new().dma(esp_idf_svc::hal::spi::Dma::Auto(4096));
         let spi_driver = SpiDriver::new(spi, sclk, mosi, None::<esp_idf_svc::hal::gpio::AnyInputPin>, &bus_config)
             .map_err(|e| HalError::LcdInitFailed(format!("SPI driver: {e}")))?;
         let dev_config = Config::new()
@@ -144,7 +145,12 @@ impl LcdDriver {
             ((self.h - 1) >> 8) as u8,
             ((self.h - 1) & 0xFF) as u8,
         ])?;
-        // Memory write — DC high for the framebuffer data.
+        // RAMWR (0x2C) — tell ST7789 the following bytes are pixel data
+        // written to GRAM. Without this command the pixel bytes would be
+        // misinterpreted as params of the previous command (0x2B/RASET) and
+        // GRAM would never be written → garbage screen.
+        self.write_cmd(0x2C, &[])?;
+        // DC high for the framebuffer data (write_cmd(0x2C,&[]) leaves DC low).
         self.dc
             .set_high()
             .map_err(|e| HalError::LcdInitFailed(format!("DC high: {e}")))?;

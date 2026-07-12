@@ -14,8 +14,18 @@
 use std::fmt;
 use std::sync::Mutex;
 
+use embedded_graphics::geometry::Point;
+use embedded_graphics::mono_font::ascii::FONT_6X9;
+use embedded_graphics::mono_font::MonoTextStyle;
+use embedded_graphics::pixelcolor::{Rgb565, RgbColor};
+use embedded_graphics::prelude::*;
+use embedded_graphics::text::Text;
+
 use crate::board_profile::BoardProfile;
 use crate::hal::backlight::BacklightDriver;
+use crate::hal::lcd::LcdDriver;
+use crate::hal::HalError;
+use crate::services::display_buf::Rgb565Buf;
 
 /// Drawing command. design D11.
 #[derive(Debug, Clone, Copy)]
@@ -23,6 +33,10 @@ pub enum DrawCmd {
     SlintUpdate,
     Clear,
     RawFramebuffer(&'static [u8]),
+    /// Re-push the current framebuffer to the LCD as-is, without
+    /// re-rendering. Used after `screen_on()` to restore the retained
+    /// framebuffer image on wake.
+    Redraw,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,12 +98,21 @@ impl DisplayService for DisplayServiceStub {
 unsafe impl Send for DisplayServiceStub {}
 unsafe impl Sync for DisplayServiceStub {}
 
-// ---- Real HAL impl (LEDC PWM via BacklightDriver) ------------------------
+// ---- Real HAL impl (LEDC PWM + ST7789 framebuffer pump) ------------------
 
-/// Real display service backed by `BacklightDriver` (LEDC PWM on GPIO6).
-/// The `present()` method is a no-op until the slint runtime backend is wired.
+/// Holds the LCD driver and its framebuffer together so `present()` can
+/// draw into the buffer and push it to the panel under a single lock.
+struct DisplayInner {
+    lcd: LcdDriver,
+    fb: Rgb565Buf,
+}
+
+/// Real display service: LEDC backlight PWM + ST7789 framebuffer pump via
+/// `embedded-graphics`. `present()` translates `DrawCmd` into framebuffer
+/// fills / direct pushes. `draw_boot_screen()` renders a startup banner.
 pub struct HalDisplayService {
     backlight: Mutex<BacklightDriver>,
+    inner: Mutex<DisplayInner>,
     brightness: Mutex<u8>,
     state: Mutex<ScreenState>,
 }
@@ -104,13 +127,71 @@ impl fmt::Debug for HalDisplayService {
 }
 
 impl HalDisplayService {
-    /// Construct from an owned `BacklightDriver` (moved from `Hal`).
-    pub fn new(backlight: BacklightDriver) -> Self {
+    /// Construct from an owned `BacklightDriver` + `LcdDriver` (moved out of
+    /// `Hal`). Allocates a `LCD_W × LCD_H` RGB565 framebuffer on the heap.
+    pub fn new(backlight: BacklightDriver, lcd: LcdDriver) -> Self {
+        let fb = Rgb565Buf::new(BoardProfile::LCD_W, BoardProfile::LCD_H);
         Self {
             backlight: Mutex::new(backlight),
+            inner: Mutex::new(DisplayInner { lcd, fb }),
             brightness: Mutex::new(BoardProfile::DEFAULT_BRIGHTNESS),
             state: Mutex::new(ScreenState::On),
         }
+    }
+
+    /// Render the boot screen (dark background + version text) into the
+    /// framebuffer and push it to the LCD once. Called at startup before
+    /// entering the main loop, to eliminate the post-init garbage screen.
+    pub fn draw_boot_screen(&self) {
+        let mut inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                log::error!("DisplayInner lock poisoned: {e}");
+                return;
+            }
+        };
+        // Dark navy background.
+        let bg = Rgb565::new(0x04, 0x02, 0x10); // ~#040410-ish in RGB565
+        inner.fb.fill(bg);
+        // White centered title + version.
+        let style = MonoTextStyle::new(&FONT_6X9, Rgb565::WHITE);
+        let title = "Intercom";
+        let ver = concat!("v", env!("CARGO_PKG_VERSION"));
+        // Center text horizontally: FONT_6X9 width = 6px per char.
+        let title_w = (title.len() as u32) * 6;
+        let ver_w = (ver.len() as u32) * 6;
+        let cx = (BoardProfile::LCD_W as i32 - title_w as i32) / 2;
+        let vx = (BoardProfile::LCD_W as i32 - ver_w as i32) / 2;
+        let _ = Text::new(title, Point::new(cx, BoardProfile::LCD_H as i32 / 2 - 4), style)
+            .draw(&mut inner.fb);
+        let _ = Text::new(ver, Point::new(vx, BoardProfile::LCD_H as i32 / 2 + 10), style)
+            .draw(&mut inner.fb);
+        let DisplayInner { lcd, fb } = &mut *inner;
+        if let Err(e) = lcd.present(fb.as_bytes()) {
+            log::error!("Boot screen LCD push failed: {e:?}");
+        }
+    }
+
+    /// Give view layer direct write access to the framebuffer, then
+    /// automatically push the framebuffer to the LCD. This is the single
+    /// render→present entry point used by the main loop.
+    pub fn with_fb<F>(&self, f: F) -> Result<(), HalError>
+    where
+        F: FnOnce(&mut Rgb565Buf),
+    {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| HalError::LcdInitFailed(format!("DisplayInner lock: {e}")))?;
+        let inner = &mut *inner;
+        f(&mut inner.fb);
+        inner.lcd.present(inner.fb.as_bytes())
+    }
+
+    /// Whether the screen is currently on (controls whether the main loop
+    /// calls `with_fb`).
+    pub fn is_screen_on(&self) -> bool {
+        *self.state.lock().unwrap() == ScreenState::On
     }
 }
 
@@ -136,8 +217,33 @@ impl DisplayService for HalDisplayService {
     fn is_screen_on(&self) -> bool {
         *self.state.lock().unwrap() == ScreenState::On
     }
-    fn present(&self, _cmd: &DrawCmd) {
-        // TODO: slint backend refresh + ST7789 framebuffer push via LcdDriver.
+    fn present(&self, cmd: &DrawCmd) {
+        match cmd {
+            DrawCmd::Clear => {
+                if let Ok(mut inner) = self.inner.lock() {
+                    inner.fb.fill(Rgb565::BLACK);
+                    let DisplayInner { lcd, fb } = &mut *inner;
+                    let _ = lcd.present(fb.as_bytes());
+                }
+            }
+            DrawCmd::RawFramebuffer(data) => {
+                if let Ok(mut inner) = self.inner.lock() {
+                    let _ = inner.lcd.present(data);
+                }
+            }
+            DrawCmd::SlintUpdate => {
+                log::warn!("SlintUpdate ignored — slint runtime backend not wired");
+            }
+            DrawCmd::Redraw => {
+                if let Ok(mut inner) = self.inner.lock() {
+                    let DisplayInner { lcd, fb } = &mut *inner;
+                    // Re-push the retained framebuffer without re-rendering.
+                    if let Err(e) = lcd.present(fb.as_bytes()) {
+                        log::error!("Redraw LCD push failed: {e:?}");
+                    }
+                }
+            }
+        }
     }
 }
 

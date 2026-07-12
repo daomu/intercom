@@ -12,6 +12,9 @@ use std::fmt;
 use crate::intercom::state::{IntercomMode, VoiceState};
 use crate::intercom::voice::{VoiceAction, VoiceEvent, VoicePttMachine};
 use crate::services::input::InputEvent;
+use crate::apps::view::intercom_view::IntercomPage;
+use crate::apps::{App, AppContext, HitTarget, RenderCtx};
+use crate::services::display_buf::Rgb565Buf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntercomUiState {
@@ -45,6 +48,7 @@ pub struct IntercomApp {
     ptt: VoicePttMachine,
     mode: IntercomMode,
     peers: Vec<PeerCard>,
+    page: IntercomPage,
 }
 
 impl fmt::Debug for IntercomApp {
@@ -64,11 +68,20 @@ impl IntercomApp {
             ptt: VoicePttMachine::new(mode),
             mode,
             peers: Vec::new(),
+            page: IntercomPage::Main,
         }
     }
 
     pub fn ui_state(&self) -> IntercomUiState {
         self.ui_state
+    }
+
+    pub fn page(&self) -> IntercomPage {
+        self.page
+    }
+
+    pub fn set_page(&mut self, page: IntercomPage) {
+        self.page = page;
     }
 
     pub fn mode(&self) -> IntercomMode {
@@ -176,6 +189,24 @@ impl IntercomApp {
             voice_actions: voice_outcome.actions,
             refresh_peer_cards: false,
         }
+    }
+}
+
+impl App for IntercomApp {
+    fn id(&self) -> &str { "intercom" }
+    fn title(&self) -> &str { "Intercom" }
+    fn on_enter(&mut self, _ctx: &AppContext) {}
+    fn on_exit(&mut self, _ctx: &AppContext) {}
+    fn on_event(&mut self, _ev: &InputEvent, _ctx: &AppContext) {
+        // PTT input routing handled by dispatch() (called directly by
+        // controller in dispatch_touch/dispatch_button).
+    }
+    fn on_tick(&mut self, _ctx: &AppContext) {}
+    fn render(&self, fb: &mut Rgb565Buf, ctx: &RenderCtx) {
+        crate::apps::view::intercom_view::draw_intercom(fb, ctx, self, self.page);
+    }
+    fn hit_test(&self, x: i32, y: i32, _ctx: &RenderCtx) -> Option<HitTarget> {
+        crate::apps::view::intercom_view::hit_test(x, y, self.page)
     }
 }
 

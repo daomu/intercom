@@ -8,6 +8,7 @@
 pub mod audio_service;
 pub mod crypto;
 pub mod display;
+pub mod display_buf;
 pub mod input;
 pub mod network;
 pub mod power;

@@ -102,7 +102,7 @@ pub fn init() -> Result<Hal, HalError> {
 
     // 3. Shared I2C bus (SDA=GPIO8, SCL=GPIO7) for touch + ES8311 + ES7210.
     let i2c_config = I2cConfig::new().baudrate(esp_idf_svc::hal::units::Hertz(400_000));
-    let i2c = I2cDriver::new(
+    let mut i2c = I2cDriver::new(
         peripherals.i2c0,
         peripherals.pins.gpio8, // SDA
         peripherals.pins.gpio7, // SCL
@@ -112,7 +112,7 @@ pub fn init() -> Result<Hal, HalError> {
     log::info!("I2C bus init OK");
 
     // 4. Touch (CST816 on shared I2C bus, addr 0x15).
-    let touch = touch::TouchDriver::init()?;
+    let touch = touch::TouchDriver::init(&mut i2c)?;
     log::info!("Touch init OK");
 
     // 5. Buttons (BOOT=GPIO9 + PLUS=GPIO18, input + pull-up).
@@ -153,6 +153,8 @@ pub fn init() -> Result<Hal, HalError> {
     log::info!("AudioOut init OK");
 
     // 10. Radio (EspWifi STA + EspNow on DISCOVERY_CHANNEL).
+    // Note: WiFi init may briefly disrupt USB CDC — monitor may disconnect.
+    log::info!("Radio init starting (WiFi + ESP-NOW)...");
     let radio = radio::RadioDriver::init(peripherals.modem)?;
     log::info!("Radio init OK");
 

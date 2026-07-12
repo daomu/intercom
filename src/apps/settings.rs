@@ -14,6 +14,9 @@
 use std::fmt;
 use std::sync::Mutex;
 
+use crate::apps::{App, AppContext, HitTarget, RenderCtx};
+use crate::services::display_buf::Rgb565Buf;
+use crate::services::input::InputEvent;
 use crate::services::power::ResetReason;
 use crate::services::storage::{DiagInfo, Settings, StorageService};
 use crate::board_profile::BoardProfile;
@@ -211,6 +214,36 @@ pub trait SettingsAppTrait: Send + Sync + fmt::Debug {
     fn load(&self) -> Settings;
     fn save(&self, s: &Settings);
     fn reset(&self);
+}
+
+// ---- App trait impl (view-layer delegation) -----------------------------
+
+impl App for SettingsApp {
+    fn id(&self) -> &str {
+        "settings"
+    }
+    fn title(&self) -> &str {
+        "Settings"
+    }
+    fn on_enter(&mut self, _ctx: &AppContext) {}
+    fn on_exit(&mut self, _ctx: &AppContext) {}
+    fn on_event(&mut self, _ev: &InputEvent, _ctx: &AppContext) {
+        // Settings input routing (swipe / tap) is handled by the controller
+        // calling `swipe_next` / `swipe_prev` / `set_*` directly. The App
+        // trait lifecycle no-ops here to avoid double-dispatch.
+    }
+    fn on_tick(&mut self, _ctx: &AppContext) {}
+    fn render(&self, fb: &mut Rgb565Buf, ctx: &RenderCtx) {
+        crate::apps::view::settings_view::draw_settings(
+            fb,
+            ctx,
+            self.page(),
+            self.factory_reset_state(),
+        );
+    }
+    fn hit_test(&self, x: i32, y: i32, _ctx: &RenderCtx) -> Option<HitTarget> {
+        crate::apps::view::settings_view::hit_test(x, y, self.page(), self.factory_reset_state())
+    }
 }
 
 // ---- About page data (safety-diagnostics change 16, task 5.2) -----------
