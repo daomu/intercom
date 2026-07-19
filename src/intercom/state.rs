@@ -77,6 +77,21 @@ pub enum IntercomEvent {
     ChannelBusy,
     PttReady,
     PairFailed(String),
+    /// A host beacon was discovered/updated during search; payload is the
+    /// current discovered-host count (UI reads the list from the coordinator).
+    HostDiscovered(usize),
+    /// Local device's join request was accepted by the host.
+    JoinAccepted,
+    /// Local device's join request was rejected; payload is a display reason.
+    JoinRejected(String),
+    /// Three-phase pairing completed and the encrypted mesh is up.
+    GroupFormed,
+    /// Local device left the group (NVS cleared, peers removed).
+    LeftGroup,
+    /// A peer's TALK_STATE changed (talking = true on start, false on end).
+    TalkState { sender_id: u8, talking: bool },
+    /// The peer roster changed (add/remove/online/offline) — UI should refresh.
+    PeerListChanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

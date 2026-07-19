@@ -74,6 +74,20 @@ pub const SCREEN_OFF_MIN_SEC: u32 = 5;
 pub const SCREEN_OFF_MAX_SEC: u32 = 300;
 pub const DEVICE_NAME_MAX_LEN: usize = 16;
 
+/// Controller-facing side-effect signal (wire-settings-side-effects).
+/// Most field editors only persist to NVS, but some require the controller
+/// (main loop, which owns the services) to run a hardware action. Setters
+/// return this so the caller can apply the effect immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsOutcome {
+    /// No controller side-effect required (NVS persistence already done).
+    Nop,
+    /// Brightness changed to `.0`; controller SHALL call
+    /// `DisplayService::set_brightness(.0)` so the panel updates immediately
+    /// instead of only being persisted.
+    BrightnessChanged(u8),
+}
+
 pub struct SettingsApp {
     settings: Settings,
     page: SettingsPage,
@@ -142,9 +156,10 @@ impl SettingsApp {
         self.persist();
     }
 
-    pub fn set_brightness(&mut self, v: u8) {
+    pub fn set_brightness(&mut self, v: u8) -> SettingsOutcome {
         self.settings.brightness = v.min(BRIGHTNESS_MAX);
         self.persist();
+        SettingsOutcome::BrightnessChanged(self.settings.brightness)
     }
 
     pub fn set_muted(&mut self, m: bool) {

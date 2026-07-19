@@ -64,6 +64,11 @@ impl BacklightDriver {
         Ok(drv)
     }
 
+    /// Minimum applied duty so brightness 0 does not fully black out the
+    /// screen (wire-settings-side-effects: floor at ~5% of the 8-bit range so
+    /// the UI keeps visual feedback). `off()` bypasses this to reach duty 0.
+    const MIN_VISIBLE_DUTY: u32 = 13; // ≈5% of 255
+
     fn pct_to_duty(pct: u8) -> u32 {
         let pct = pct.min(100) as u32;
         // 8-bit resolution → max duty = 255. Map 0..=100 → 0..=255.
@@ -71,12 +76,14 @@ impl BacklightDriver {
     }
 
     /// Set brightness 0..=100. Persists non-zero value for `on()` recovery.
+    /// The applied duty is floored at `MIN_VISIBLE_DUTY` so a stored value of
+    /// 0 still leaves the panel dimly lit (never a full black-out).
     pub fn set_brightness(&mut self, v: u8) -> Result<(), HalError> {
         let v = v.min(100);
         if v != 0 {
             self.last_nonzero_pct = v;
         }
-        let duty = Self::pct_to_duty(v);
+        let duty = Self::pct_to_duty(v).max(Self::MIN_VISIBLE_DUTY);
         self.channel
             .set_duty(duty)
             .map_err(|e| HalError::BacklightInitFailed(format!("LEDC set_duty: {e}")))

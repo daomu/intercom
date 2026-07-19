@@ -53,6 +53,13 @@ pub enum VoiceAction {
     ArmCapture,
     /// Disarm capture — discard capture frames until armed again.
     DisarmCapture,
+    /// Start playing back the VoiceChanger preview buffer (change
+    /// intercom-voice-changer-preview). The controller reads the processed
+    /// buffer from `IntercomApp::preview_buffer` and submits it to the audio
+    /// service. Unit variant (no payload) because `VoiceAction` is `Copy`.
+    StartPreviewPlayback,
+    /// Stop the VoiceChanger preview playback.
+    StopPreviewPlayback,
 }
 
 /// Outcome of handling an event: new state + actions to execute.

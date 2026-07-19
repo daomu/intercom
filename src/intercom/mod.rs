@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
+pub mod codec;
 pub mod heartbeat;
 pub mod jitter;
 pub mod pairing;

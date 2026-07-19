@@ -225,6 +225,32 @@ impl Default for PitchShifter {
     }
 }
 
+/// Apply a voice effect to a whole PCM buffer, returning a new buffer of the
+/// same length. Used by the VoiceChanger preview path (change
+/// intercom-voice-changer-preview): record 3s → `apply_effect` → play back.
+///
+/// This wraps the real `PitchShifter` PSOLA implementation (not a gain-only
+/// placeholder — the design's `apply_effect` gain stub is superseded by the
+/// existing pitch shifter). `Normal` is a pass-through copy.
+pub fn apply_effect(pcm: &[i16], effect: VoiceEffect) -> Vec<i16> {
+    if effect == VoiceEffect::Normal || pcm.is_empty() {
+        return pcm.to_vec();
+    }
+    const FRAME: usize = 320;
+    let mut shifter = PitchShifter::new();
+    shifter.set_effect(effect);
+    let mut out = vec![0i16; pcm.len()];
+    let mut i = 0;
+    while i < pcm.len() {
+        let end = (i + FRAME).min(pcm.len());
+        // PitchShifter::process requires equal-length slices.
+        let (in_frame, out_frame) = (&pcm[i..end], &mut out[i..end]);
+        shifter.process(in_frame, out_frame);
+        i = end;
+    }
+    out
+}
+
 // ---- Trait shim for callers expecting a service-like object ---------------
 
 pub trait VoiceChanger: Send + Sync + fmt::Debug {
@@ -347,6 +373,31 @@ mod tests {
         let buf = sine_buf(640, 200.0, 16000.0);
         let p = estimate_pitch(&buf).unwrap_or(0);
         assert!((p as i32 - 80).abs() <= 4, "expected ~80, got {}", p);
+    }
+
+    // ---- apply_effect (change intercom-voice-changer-preview) -----------
+
+    #[test]
+    fn apply_effect_normal_is_passthrough() {
+        let pcm = sine_buf(640, 200.0, 16000.0);
+        let out = apply_effect(&pcm, VoiceEffect::Normal);
+        assert_eq!(out, pcm);
+    }
+
+    #[test]
+    fn apply_effect_empty_is_empty() {
+        let out = apply_effect(&[], VoiceEffect::PitchUp);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn apply_effect_preserves_length_across_frames() {
+        // Multi-frame buffer (24000 = 3s @ 8kHz) → same-length output.
+        let pcm = sine_buf(24000, 200.0, 8000.0);
+        let up = apply_effect(&pcm, VoiceEffect::PitchUp);
+        let down = apply_effect(&pcm, VoiceEffect::PitchDown);
+        assert_eq!(up.len(), pcm.len());
+        assert_eq!(down.len(), pcm.len());
     }
 
     /// Thread-safe wrapper for the trait shim (process needs &mut self,

@@ -15,7 +15,7 @@ pub mod view;
 
 use std::sync::{Arc, Mutex};
 
-use crate::intercom::state::IntercomMode;
+use crate::intercom::state::{IntercomMode, VoiceEffect};
 use crate::services::display_buf::Rgb565Buf;
 use crate::services::input::InputEvent;
 use crate::services::storage::Settings;
@@ -52,15 +52,15 @@ pub struct RenderCtx<'a> {
 }
 
 /// Cross-thread UI event (replaces `slint::invoke_from_event_loop`).
-/// Producers (ESP-NOW / audio threads) push; main loop drains each tick.
+/// Producers (ESP-NOW / audio threads, coordinator) push; main loop drains
+/// each tick.
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     /// Generic "redraw requested" — set when any model state changes.
     Dirty,
-    /// Intercom event from ESP-NOW thread. Placeholder `()` until the real
-    /// `IntercomEvent` type is delivered by its change; drained events are
-    /// logged and ignored (no panic).
-    Intercom(()),
+    /// Intercom event delivered from the network/coordinator layer; drained
+    /// by the main loop and dispatched to `IntercomApp::on_intercom_event`.
+    Intercom(crate::intercom::state::IntercomEvent),
     /// Network event. Placeholder `()` until the real `NetworkEvent` type
     /// is delivered.
     Network(()),
@@ -89,21 +89,17 @@ pub fn push_ui_event(queue: &UiEventQueue, ev: UiEvent) {
     }
 }
 
-/// Drain all pending UI events (consumer side). Returns whether any events
-/// were drained (caller sets `dirty = true` if so). Placeholder variants
-/// (`Intercom(())` / `Network(())` / `Audio(())`) are logged and ignored —
-/// they do not panic; once the real event types are delivered by their
-/// changes, dispatch logic will replace the log-and-ignore path.
-pub fn drain_ui_events(queue: &UiEventQueue) -> bool {
-    let mut any = false;
+/// Drain all pending UI events (consumer side). Returns the ordered list of
+/// `IntercomEvent`s so the main loop can dispatch them to
+/// `IntercomApp::on_intercom_event`. `Dirty` / `Network` / `Audio` variants
+/// are consumed for their redraw side-effect and do not appear in the result.
+pub fn drain_ui_events(queue: &UiEventQueue) -> Vec<crate::intercom::state::IntercomEvent> {
+    let mut out = Vec::new();
     if let Ok(mut q) = queue.lock() {
         while let Some(ev) = q.pop_front() {
-            any = true;
-            match &ev {
+            match ev {
                 UiEvent::Dirty => {}
-                UiEvent::Intercom(_) => {
-                    log::debug!("UiEvent::Intercom placeholder drained (real type pending)");
-                }
+                UiEvent::Intercom(ie) => out.push(ie),
                 UiEvent::Network(_) => {
                     log::debug!("UiEvent::Network placeholder drained (real type pending)");
                 }
@@ -113,7 +109,7 @@ pub fn drain_ui_events(queue: &UiEventQueue) -> bool {
             }
         }
     }
-    any
+    out
 }
 
 /// Touch hit-test result. Each view defines its own targets via this enum;
@@ -133,6 +129,29 @@ pub enum HitTarget {
     IntercomPttArea,
     /// Intercom page navigation (left/right swipe target).
     IntercomPageNav { forward: bool },
+    /// Ungrouped home: "Create Group" button (change intercom-ungrouped-ui).
+    CreateHostButton,
+    /// Ungrouped home: "Search Groups" button.
+    SearchHostsButton,
+    /// Searching page: a discovered-host list row (by index).
+    HostListItem { idx: u8 },
+    /// Searching page: "Join" button (uses the selected host).
+    JoinSelectedButton,
+    /// Searching page: "Refresh" button (rescan).
+    RefreshHostsButton,
+    /// Creating/Searching/Joining pages: "Back"/"Cancel" button.
+    PairingBackButton,
+    /// VoiceChanger page: an effect selector button (change
+    /// intercom-voice-changer-preview). Carries the tapped effect.
+    VoiceEffectButton(VoiceEffect),
+    /// VoiceChanger page: "Cancel" button shown during record/preview.
+    CancelVoicePreviewButton,
+    /// GroupInfo page: "Leave Group" button (change intercom-group-info-leave).
+    LeaveGroupButton,
+    /// Leave-confirm modal: "Confirm" button.
+    ConfirmLeaveButton,
+    /// Leave-confirm modal: "Cancel" button.
+    CancelLeaveButton,
     /// Volume panel: mute button.
     VolumeMuteBtn,
     /// Volume panel: close (tap on mask).

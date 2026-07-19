@@ -27,6 +27,41 @@ impl RecvEvent {
     }
 }
 
+/// Cross-thread network event. Produced by the ESP-NOW recv/send callbacks
+/// (which run on the Wi-Fi FFI thread) and drained by the main loop, so the
+/// callbacks never touch model state directly. change: wire-network-runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkEvent {
+    /// A packet was received (already hardware-decrypted for encrypted peers).
+    Recv(RecvEvent),
+    /// A previously-issued unicast completed (true = delivered/acked).
+    SendDone(bool),
+}
+
+/// Bounded cross-thread network event queue (producer = recv/send callback,
+/// consumer = main loop). Full-queue pushes are dropped + logged, never block
+/// the FFI callback thread.
+pub type NetworkEventQueue = std::sync::Arc<Mutex<std::collections::VecDeque<NetworkEvent>>>;
+
+/// Capacity cap for the network event queue (D1: drop-on-full, no back-pressure).
+pub const NETWORK_QUEUE_CAP: usize = 32;
+
+/// Create a new bounded network event queue.
+pub fn new_network_event_queue() -> NetworkEventQueue {
+    std::sync::Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(NETWORK_QUEUE_CAP)))
+}
+
+/// Push a network event (producer side, non-blocking). Drops + warns on full.
+pub fn push_network_event(queue: &NetworkEventQueue, ev: NetworkEvent) {
+    if let Ok(mut q) = queue.lock() {
+        if q.len() >= NETWORK_QUEUE_CAP {
+            log::warn!("NetworkEvent queue full, dropping event");
+            return;
+        }
+        q.push_back(ev);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetError {
     EspNow,
@@ -286,6 +321,13 @@ impl EspNowNetworkService {
     fn peer_known(&self, mac: &[u8; 6]) -> bool {
         self.peers.lock().unwrap().iter().any(|m| m == mac)
     }
+
+    /// Snapshot of currently-registered peer MACs (for heartbeat fan-out).
+    /// change: wire-network-runtime — the HeartbeatSink iterates this list
+    /// to unicast a HEARTBEAT packet to every group peer.
+    pub fn peer_macs(&self) -> Vec<[u8; 6]> {
+        self.peers.lock().unwrap().clone()
+    }
 }
 
 impl NetworkService for EspNowNetworkService {
@@ -414,3 +456,19 @@ impl NetworkService for EspNowNetworkService {
 
 unsafe impl Send for EspNowNetworkService {}
 unsafe impl Sync for EspNowNetworkService {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_queue_drops_when_full() {
+        // Producer pushes past capacity; excess is dropped, never panics,
+        // and the queue never exceeds NETWORK_QUEUE_CAP (D1: drop-on-full).
+        let q = new_network_event_queue();
+        for _ in 0..(NETWORK_QUEUE_CAP + 10) {
+            push_network_event(&q, NetworkEvent::SendDone(true));
+        }
+        assert_eq!(q.lock().unwrap().len(), NETWORK_QUEUE_CAP);
+    }
+}

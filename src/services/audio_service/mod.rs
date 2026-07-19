@@ -4,6 +4,8 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
+pub mod thread;
+
 use std::fmt;
 
 use crate::board_profile::BoardProfile;
@@ -326,6 +328,40 @@ impl HalAudioService {
     /// Plug in a voice-changer stage (None = passthrough).
     pub fn set_effect_stage(&self, stage: Option<Box<dyn VoiceEffectStage>>) {
         *self.effect_stage.lock().unwrap() = stage;
+    }
+
+    /// Read one 20ms PCM frame from the I2S RX channel (ES7210) and apply the
+    /// pluggable effect stage. Blocks on the I2S read. Used by the audio
+    /// thread TX path (wire-audio-pipeline task 2.2).
+    pub fn capture_frame(&self) -> Result<[i16; PCM_SAMPLES_PER_FRAME], AudioError> {
+        let mut buf = [0u8; PCM_SAMPLES_PER_FRAME * 2];
+        {
+            let audio_in = self.audio_in.lock().unwrap();
+            let mut i2s = self.i2s.lock().unwrap();
+            audio_in
+                .read_pcm(&mut i2s, &mut buf)
+                .map_err(Self::map_err)?;
+        }
+        // Reinterpret native LE bytes as i16 samples.
+        let mut pcm = [0i16; PCM_SAMPLES_PER_FRAME];
+        for (i, s) in pcm.iter_mut().enumerate() {
+            *s = i16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]);
+        }
+        // Apply the pluggable voice-changer stage (None = passthrough).
+        if let Some(stage) = self.effect_stage.lock().unwrap().as_ref() {
+            stage.process(&mut pcm);
+        }
+        Ok(pcm)
+    }
+
+    /// True while capture is armed (main thread sets via `start_capture`).
+    pub fn is_capturing(&self) -> bool {
+        *self.capturing.lock().unwrap()
+    }
+
+    /// True while playback is active (main thread sets via `start_playback`).
+    pub fn is_playing(&self) -> bool {
+        *self.playing.lock().unwrap()
     }
 
     fn map_err(e: HalError) -> AudioError {
